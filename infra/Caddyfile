@@ -1,0 +1,33 @@
+{
+	# Caddy manages/renews public certificates automatically. Set ACME_EMAIL in
+	# the service environment to receive expiry and account notifications.
+	email {$ACME_EMAIL:admin@aamar.cloud}
+}
+
+ilma.aamar.cloud {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	reverse_proxy localhost:8000 {
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Host {host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	# If this Caddy instance uses the Cloudflare DNS module (as in ~/infra),
+	# uncomment the block below and provide CLOUDFLARE_API_TOKEN in the Caddy
+	# environment for DNS-01 issuance instead of HTTP-01/TLS-ALPN challenges.
+	# tls {
+	# 	dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	# 	curves x25519mlkem768 x25519
+	# }
+}

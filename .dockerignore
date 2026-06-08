@@ -1,0 +1,49 @@
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Python bytecode/caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments and local tooling
+.venv/
+venv/
+env/
+.tox/
+.nox/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Local secrets/config
+.env
+.env.*
+!.env.example
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test/runtime artifacts
+.cache/
+logs/
+*.log
+
+# Compose-managed local data (if a bind mount is ever used instead of named volumes)
+docker/**/data/
+docker/**/.data/
