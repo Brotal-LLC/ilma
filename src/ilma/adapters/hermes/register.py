@@ -220,7 +220,15 @@ def _register_memory_override(ctx: Any, service: Any | None) -> None:
             result = service.ilma_forget(memory_id)
             return json.dumps(result)
         if action == "list":
-            result = service.ilma_status()
+            list_memories = getattr(service, "ilma_list_memories", None)
+            if callable(list_memories):
+                result = list_memories(
+                    limit=kwargs.get("limit", 50),
+                    offset=kwargs.get("offset", 0),
+                    include_deleted=kwargs.get("include_deleted", False),
+                )
+            else:
+                result = service.ilma_status()
             return json.dumps(result)
         if action == "replace":
             memory_id = kwargs.get("memory_id")
