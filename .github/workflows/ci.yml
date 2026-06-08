@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ilma
+          POSTGRES_PASSWORD: ilma
+          POSTGRES_DB: ilma_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv pip install -e ".[dev,http,mcp]"
+
+      - name: Lint
+        run: |
+          uv run ruff check src/ tests/
+          uv run ruff format --check src/ tests/
+
+      - name: Type check
+        run: uv run mypy src/ilma --ignore-missing-imports
+
+      - name: Test
+        env:
+          ILMA_DSN: postgresql://ilma:ilma@localhost:5432/ilma_test
+        run: uv run pytest tests/ -v --tb=short
+
+      - name: Build Docker image
+        run: docker build -t ilma:test .
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Docker Compose configs
+        run: |
+          docker compose -f docker/postgres/compose.yaml config > /dev/null
+          docker compose -f docker/api/compose.yaml config > /dev/null
+
+      - name: Build API image
+        run: docker build -t ilma:ci .
