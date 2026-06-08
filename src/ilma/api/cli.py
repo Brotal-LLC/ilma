@@ -6,6 +6,8 @@ standard third-party CLI/runtime packages.  It does not depend on Hermes Agent.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 from collections.abc import Mapping, Sequence
@@ -18,6 +20,7 @@ import typer
 from ilma import __version__
 from ilma.api.mcp import IlmaConfigError, IlmaMcpService, _dsn_from_env, create_mcp_server
 from ilma.embeddings import EmbedderRegistry
+from ilma.migration import migrate_hermes_config, migrate_hermes_v2_schema
 from ilma.storage.postgres import PgBackend
 
 try:  # psycopg is a core dependency, but keep import failure user-friendly.
@@ -73,6 +76,70 @@ def _json_safe(value: Any) -> Any:
 
 def _echo_json(payload: Mapping[str, Any]) -> None:
     typer.echo(json.dumps(_json_safe(payload), indent=2, sort_keys=True))
+
+
+def _stringify_csv_value(value: Any) -> str:
+    value = _json_safe(value)
+    if isinstance(value, Mapping | list):
+        return json.dumps(value, sort_keys=True)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _echo_csv(rows: Sequence[Mapping[str, Any]]) -> None:
+    fields = [
+        "id",
+        "operation_id",
+        "tool_name",
+        "surface",
+        "action",
+        "status",
+        "created_at",
+        "completed_at",
+        "error_type",
+        "error_message",
+        "payload",
+        "result",
+    ]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({field: _stringify_csv_value(row.get(field)) for field in fields})
+    typer.echo(buffer.getvalue().rstrip("\n"))
+
+
+def _call_repair(service: Any, *, force: bool) -> Mapping[str, Any]:
+    try:
+        return cast(Mapping[str, Any], service.ilma_repair(force=force))
+    except TypeError:
+        if force:
+            raise
+        return cast(Mapping[str, Any], service.ilma_repair())
+
+
+def _call_audit(
+    service: Any,
+    *,
+    tool: str | None,
+    status: str | None,
+    start: str | None,
+    end: str | None,
+    limit: int,
+    offset: int,
+) -> Mapping[str, Any]:
+    return cast(
+        Mapping[str, Any],
+        service.ilma_audit(
+            tool=tool,
+            status=status,
+            start=start,
+            end=end,
+            limit=limit,
+            offset=offset,
+        ),
+    )
 
 
 def _error_message(result: Mapping[str, Any]) -> str:
@@ -394,23 +461,134 @@ def doctor(
 
 @app.command()
 def repair(
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Apply repairs (delete orphan chunks, reindex, vacuum)."),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
 ) -> None:
-    """Repair/verify all schemas and audit logging."""
+    """Inspect storage damage and optionally repair safe Postgres issues."""
 
-    result = _service_from_env().ilma_repair()
+    result = _call_repair(_service_from_env(), force=force)
     _exit_if_failed(result, json_output=json_output)
     if json_output:
         _echo_json(result)
     else:
         typer.echo(str(result.get("message") or "Repair complete."))
+        findings = result.get("findings", {})
+        if isinstance(findings, Mapping):
+            orphaned = findings.get("orphaned_chunks", {})
+            duplicates = findings.get("duplicate_memories", {})
+            fts = findings.get("fts_indexes", {})
+            if isinstance(orphaned, Mapping):
+                typer.echo(f"  orphaned_chunks={orphaned.get('count', 0)}")
+            if isinstance(duplicates, Mapping):
+                typer.echo(f"  duplicate_memory_groups={duplicates.get('count', 0)}")
+            if isinstance(fts, Mapping):
+                missing = fts.get("missing", [])
+                typer.echo(
+                    f"  missing_fts_indexes={len(missing) if isinstance(missing, list) else 0}"
+                )
+
+
+@app.command()
+def audit(
+    tool: Annotated[str | None, typer.Option("--tool", help="Filter by tool name.")] = None,
+    status: Annotated[
+        str | None,
+        typer.Option("--status", help="Filter by audit status: pending, succeeded, failed."),
+    ] = None,
+    start: Annotated[
+        str | None,
+        typer.Option("--start", help="Inclusive ISO-8601 created_at lower bound."),
+    ] = None,
+    end: Annotated[
+        str | None,
+        typer.Option("--end", help="Inclusive ISO-8601 created_at upper bound."),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=1000)] = 100,
+    offset: Annotated[int, typer.Option("--offset", min=0)] = 0,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", help="Output format: table, json, or csv."),
+    ] = "table",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
+) -> None:
+    """Query the write-ahead audit log."""
+
+    result = _call_audit(
+        _service_from_env(),
+        tool=tool,
+        status=status,
+        start=start,
+        end=end,
+        limit=limit,
+        offset=offset,
+    )
+    _exit_if_failed(result, json_output=json_output or output_format == "json")
+    rows = result.get("results", [])
+    if not isinstance(rows, list):
+        rows = []
+    safe_rows = [row for row in rows if isinstance(row, Mapping)]
+    fmt = output_format.strip().lower()
+    if json_output or fmt == "json":
+        _echo_json(result)
+    elif fmt == "csv":
+        _echo_csv(safe_rows)
+    elif fmt == "table":
+        if not safe_rows:
+            typer.echo("No audit log rows found.")
+            return
+        for row in safe_rows:
+            typer.echo(
+                f"[{row.get('id', '?')}] {row.get('created_at', '')} "
+                f"{row.get('tool_name', '?')} {row.get('status', '?')} "
+                f"surface={row.get('surface', '?')} action={row.get('action', '?')}"
+            )
+            if row.get("error_message"):
+                typer.echo(f"    error={row.get('error_type')}: {row.get('error_message')}")
+    else:
+        raise typer.BadParameter("--format must be one of: table, json, csv")
 
 
 @app.command()
 def migrate(
+    dsn: Annotated[str | None, typer.Option("--dsn", help="Postgres DSN to migrate.")] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Inspect hermes-memory v2 data without writing ilma rows."),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
 ) -> None:
-    """Run idempotent schema migrations for all surfaces."""
+    """Migrate hermes-memory v2 data into ilma, or run ilma schema migrations."""
+
+    resolved_dsn = dsn
+    if resolved_dsn is None:
+        try:
+            resolved_dsn = _dsn_from_env()
+        except IlmaConfigError:
+            resolved_dsn = None
+
+    if resolved_dsn is not None:
+        progress = None if json_output else (lambda message: typer.echo(f"- {message}"))
+        result = migrate_hermes_v2_schema(resolved_dsn, dry_run=dry_run, progress=progress)
+        _exit_if_failed(result, json_output=json_output)
+        if result.get("detected"):
+            if json_output:
+                _echo_json(result)
+            else:
+                typer.echo(
+                    f"Migration complete: inserted={result.get('inserted', 0)} "
+                    f"updated={result.get('updated', 0)} skipped={result.get('skipped', 0)} "
+                    f"conflicts={result.get('conflicts', 0)}"
+                )
+            return
+        if dry_run:
+            if json_output:
+                _echo_json(result)
+            else:
+                typer.echo(str(result.get("message") or "No hermes-memory v2 schema found."))
+            return
 
     result = _service_from_env().ilma_migrate()
     _exit_if_failed(result, json_output=json_output)
@@ -421,6 +599,37 @@ def migrate(
             f"Migration complete: surfaces={result.get('surfaces', len(SURFACES))} "
             f"audit_log={result.get('audit_log', True)}"
         )
+
+
+@app.command("migrate-config")
+def migrate_config_command(
+    config: Annotated[
+        str | None,
+        typer.Option(
+            "--config", help="Path to Hermes config.yaml (default: ~/.hermes/config.yaml)."
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show changes without writing.")
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
+) -> None:
+    """Update ~/.hermes/config.yaml from hermes-memory postgres to ilma."""
+
+    try:
+        result = migrate_hermes_config(config, dry_run=dry_run)
+    except Exception as exc:
+        result = {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+    _exit_if_failed(result, json_output=json_output)
+    if json_output:
+        _echo_json(result)
+        return
+    if result.get("changed"):
+        typer.echo(f"Updated {result.get('config_path')}")
+        if result.get("backup_path"):
+            typer.echo(f"Backup written to {result.get('backup_path')}")
+    else:
+        typer.echo("Config already uses ilma; no changes needed.")
 
 
 @app.command()

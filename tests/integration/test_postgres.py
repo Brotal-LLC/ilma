@@ -337,3 +337,63 @@ def test_pg_sessions_repo_append_fetch_search_recent(clean_pg: str) -> None:
 
     assert repo.search("pgvector", top_k=3)[0].id == second_id
     assert repo.recent_sessions(limit=2)[0] == "session-b"
+
+
+def test_pg_maintenance_doctor_repair_audit_and_dedup(clean_pg: str) -> None:
+    from ilma.api.mcp import IlmaMcpService
+    from ilma.storage.postgres import PgBackend, PgMemoryRepo
+
+    repo = PgMemoryRepo(
+        clean_pg, embedders=FakeEmbedderRegistry(), min_pool_size=1, max_pool_size=4
+    )
+    memory_id = repo.remember("Memory deduplication integration check", source="dedup-test")
+    assert memory_id > 0
+    assert repo.remember("Memory deduplication integration check", source="dedup-test") == 0
+
+    with psycopg.connect(clean_pg) as conn:
+        conn.execute(
+            """
+            INSERT INTO ilma.memories (content, tags, source)
+            VALUES (%s, %s, %s)
+            """,
+            ("Memory deduplication integration check", [], "manual-duplicate"),
+        )
+
+    service = IlmaMcpService(PgBackend(clean_pg, min_pool_size=1, max_pool_size=4))
+    service.audit.initialize_schema()
+
+    doctor = service.ilma_doctor()
+    assert doctor["ok"] is True
+    assert doctor["healthy"] is True
+    assert set(doctor["checks"]["surfaces"]) == {
+        "memory",
+        "wiki",
+        "journal",
+        "skills",
+        "kanban",
+        "metrics",
+        "observability",
+        "sessions",
+    }
+    assert doctor["checks"]["pgvector"]["ok"] is True
+    assert doctor["checks"]["pool"]["ok"] is True
+    assert doctor["checks"]["embedding_dimensions"]["ok"] is True
+
+    dry_run = service.ilma_repair()
+    assert dry_run["ok"] is True
+    assert dry_run["repaired"] is False
+    assert dry_run["findings"]["duplicate_memories"]["count"] == 1
+    assert dry_run["findings"]["orphaned_chunks"]["count"] == 0
+
+    forced = service.ilma_repair(force=True)
+    assert forced["ok"] is True
+    assert forced["repaired"] is True
+    assert set(forced["actions"]["vacuum_analyze"]) == {"memories", "memory_chunks"}
+    assert "memories_content_tsv_idx" in forced["actions"]["reindexed"]
+
+    migrate = service.ilma_migrate()
+    assert migrate["ok"] is True
+    audit = service.ilma_audit(tool="ilma_migrate", status="succeeded")
+    assert audit["ok"] is True
+    assert audit["results"]
+    assert audit["results"][0]["tool_name"] == "ilma_migrate"

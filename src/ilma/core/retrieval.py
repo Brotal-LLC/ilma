@@ -23,20 +23,59 @@ _IDENTITY_BOOST = 2.0
 #: Priority boost for user/preference tags.
 _PREFERENCE_BOOST = 1.5
 
+#: Hard cap for search queries.  Postgres FTS and embedders both become wasteful
+#: on prompt-sized strings; retrieval only needs a compact intent.
+_MAX_QUERY_CHARS = 10_000
+
+_PROMPT_INJECTION_PATTERNS = (
+    r"\bignore\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+(?:instructions?|messages?|rules?|context)\b",
+    r"\bdisregard\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+(?:instructions?|messages?|rules?|context)\b",
+    r"\bforget\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+(?:instructions?|messages?|rules?|context)\b",
+    r"\boverride\s+(?:the\s+)?(?:system|developer|safety)\s+(?:prompt|instructions?|rules?)\b",
+    r"\breveal\s+(?:the\s+)?(?:system|developer)\s+(?:prompt|instructions?|message)\b",
+    r"\byou\s+are\s+now\b",
+    r"\bact\s+as\b",
+    r"\bjailbreak\b",
+)
+
+_SQL_INJECTION_PATTERNS = (
+    r"--.*$",
+    r"/\*.*?\*/",
+    r"\b(?:or|and)\s+\d+\s*=\s*\d+\b",
+    r"\bunion\s+(?:all\s+)?select\b",
+    r"\b(?:drop|truncate|alter)\s+(?:table|schema|database)\s+[\w.\"']+",
+    r"\bdelete\s+from\s+[\w.\"']+",
+    r"\binsert\s+into\s+[\w.\"']+",
+    r"\bupdate\s+[\w.\"']+\s+set\b",
+)
+
 
 def _sanitize_query(query: str) -> str:
-    """Strip prompt contamination from search queries.
+    """Strip prompt/SQL contamination from search queries.
 
     Borrowed from MemPalace: contaminated queries can drop R@10
-    from ~89.8% to ~1%.
+    from ~89.8% to ~1%.  The sanitizer is intentionally conservative: it
+    removes common instruction-hijacking phrases, SQL-injection operators, and
+    prompt/XML framing while preserving the user's remaining retrieval intent.
     """
-    # Strip system/developer/tool prefixes
-    query = re.sub(r"^(system|developer|user|assistant|tool)\s*[:\-]\s*", "", query, flags=re.I)
-    # Strip XML-like tags
-    query = re.sub(r"<[^>]+>", "", query)
+    query = str(query or "")[:_MAX_QUERY_CHARS]
+    # Strip system/developer/tool prefixes anywhere they begin a line.
+    query = re.sub(
+        r"(?im)^\s*(system|developer|user|assistant|tool)\s*[:\-]\s*",
+        "",
+        query,
+    )
+    # Strip XML-like tags, including <system> / </system> prompt wrappers.
+    query = re.sub(r"<[^>]+>", " ", query)
+    for pattern in _PROMPT_INJECTION_PATTERNS:
+        query = re.sub(pattern, " ", query, flags=re.I)
+    for pattern in _SQL_INJECTION_PATTERNS:
+        query = re.sub(pattern, " ", query, flags=re.I | re.S | re.M)
+    # Semicolons are useful SQL statement separators and rarely useful search terms.
+    query = query.replace(";", " ")
     # Collapse whitespace
     query = re.sub(r"\s+", " ", query).strip()
-    return query
+    return query[:_MAX_QUERY_CHARS]
 
 
 def _score_memory(memory: Memory) -> float:

@@ -21,6 +21,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from ilma.api.hardening import METRICS, log_observation
+from ilma.embeddings import SUPPORTED_DIMS
 from ilma.storage.postgres import PgBackend
 
 try:  # Imported at module load so the entry point fails clearly if MCP is absent.
@@ -45,6 +46,28 @@ WRITE_TOOLS: Mapping[str, tuple[str, str]] = {
     "ilma_migrate": ("maintenance", "migrate"),
     "ilma_repair": ("maintenance", "repair"),
 }
+
+SURFACE_TABLES: Mapping[str, tuple[str, ...]] = {
+    "memory": ("memories", "memory_chunks"),
+    "wiki": ("wiki_docs", "wiki_chunks"),
+    "journal": ("journal_entries",),
+    "skills": ("skills",),
+    "kanban": ("kanban_tasks",),
+    "metrics": ("metrics",),
+    "observability": ("observations",),
+    "sessions": ("sessions", "session_messages"),
+}
+
+FTS_INDEXES = (
+    "memories_content_tsv_idx",
+    "memory_chunks_content_tsv_idx",
+    "wiki_docs_content_tsv_idx",
+    "wiki_chunks_content_tsv_idx",
+    "journal_entries_content_tsv_idx",
+    "skills_body_tsv_idx",
+    "kanban_tasks_content_tsv_idx",
+    "session_messages_content_tsv_idx",
+)
 
 
 class IlmaConfigError(RuntimeError):
@@ -819,60 +842,93 @@ class IlmaMcpService:
         )
 
     # Maintenance --------------------------------------------------------
-    def ilma_repair(self) -> dict[str, Any]:
-        def run() -> dict[str, Any]:
-            self._initialize_all()
-            return _ok(repaired=True, message="schemas and audit log verified")
+    def ilma_repair(self, force: bool = False) -> dict[str, Any]:
+        """Inspect storage damage and optionally repair safe Postgres issues."""
 
-        return self.call("ilma_repair", run, {})
+        def run() -> dict[str, Any]:
+            if not force:
+                findings = self._repair_findings()
+                return _ok(
+                    repaired=False,
+                    force=False,
+                    findings=findings,
+                    message="repair dry-run complete; rerun with --force to rebuild indexes/vacuum",
+                )
+
+            self._initialize_all()
+            findings = self._repair_findings()
+            actions = self._repair_apply(findings)
+            post_findings = self._repair_findings()
+            return _ok(
+                repaired=True,
+                force=True,
+                findings=post_findings,
+                pre_repair_findings=findings,
+                actions=actions,
+                message="repair complete",
+            )
+
+        return self.call("ilma_repair", run, {"force": force})
 
     def ilma_doctor(self) -> dict[str, Any]:
         def run() -> dict[str, Any]:
-            checks: dict[str, Any] = {"dsn_configured": True, "surfaces": {}}
-            try:
-                checks["backend"] = self.backend.health()
-            except Exception as exc:
-                checks["backend"] = {
-                    "ok": False,
-                    "error": {"type": type(exc).__name__, "message": str(exc)},
-                }
-            for name, repo in {
-                "memory": self.memory,
-                "wiki": self.wiki,
-                "journal": self.journal,
-                "skills": self.skills,
-                "metrics": self.metrics,
-                "kanban": self.kanban,
-                "observability": self.observability,
-                "sessions": self.sessions,
-            }.items():
-                try:
-                    initializer = getattr(repo, "initialize_schema", None)
-                    if callable(initializer):
-                        initializer()
-                    checks["surfaces"][name] = {"ok": True}
-                except Exception as exc:
-                    checks["surfaces"][name] = {
-                        "ok": False,
-                        "error": {"type": type(exc).__name__, "message": str(exc)},
-                    }
-            try:
-                self.audit.initialize_schema()
-                checks["audit_log"] = {"ok": True}
-            except Exception as exc:
-                checks["audit_log"] = {
-                    "ok": False,
-                    "error": {"type": type(exc).__name__, "message": str(exc)},
-                }
+            checks: dict[str, Any] = {
+                "dsn_configured": True,
+                "backend": self._doctor_backend(),
+                "pgvector": self._doctor_pgvector(),
+                "pool": self._doctor_pool(),
+                "embedding_dimensions": self._doctor_embedding_dimensions(),
+                "surfaces": self._doctor_surfaces(),
+                "audit_log": self._doctor_audit_log(),
+            }
             overall = all(
-                check.get("ok", False)
-                for check in [checks.get("backend", {})]
-                + list(checks.get("surfaces", {}).values())
-                + [checks.get("audit_log", {})]
+                bool(check.get("ok", False))
+                for check in (
+                    checks["backend"],
+                    checks["pgvector"],
+                    checks["pool"],
+                    checks["embedding_dimensions"],
+                    checks["audit_log"],
+                    *checks["surfaces"].values(),
+                )
             )
             return _ok(healthy=overall, checks=checks)
 
         return self.call("ilma_doctor", run, {})
+
+    def ilma_audit(
+        self,
+        *,
+        tool: str | None = None,
+        status: str | None = None,
+        start: str | datetime | None = None,
+        end: str | datetime | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Query the audit log, with Postgres and in-memory audit support."""
+
+        return self.call(
+            "ilma_audit",
+            lambda: _ok(
+                results=self._audit_rows(
+                    tool=tool,
+                    status=status,
+                    start=_parse_datetime(start),
+                    end=_parse_datetime(end),
+                    limit=_limit(limit, default=100, maximum=1000),
+                    offset_value=_offset(offset),
+                )
+            ),
+            {
+                "tool": tool,
+                "status": status,
+                "start": start,
+                "end": end,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
 
     def ilma_migrate(self) -> dict[str, Any]:
         def run() -> dict[str, Any]:
@@ -880,6 +936,365 @@ class IlmaMcpService:
             return _ok(migrated=True, surfaces=8, audit_log=True)
 
         return self.call("ilma_migrate", run, {})
+
+    def _has_pg_pool(self) -> bool:
+        return hasattr(self.backend, "_pool")
+
+    def _repair_findings(self) -> dict[str, Any]:
+        if not self._has_pg_pool():
+            return {
+                "postgres": {"ok": False, "skipped": "backend does not expose a Postgres pool"},
+                "orphaned_chunks": {"count": 0, "rows": [], "skipped": True},
+                "duplicate_memories": {"count": 0, "groups": [], "skipped": True},
+                "fts_indexes": {"existing": [], "missing": list(FTS_INDEXES), "skipped": True},
+                "vacuum_analyze": {"tables": ["memories", "memory_chunks"], "pending": True},
+            }
+
+        findings: dict[str, Any] = {"postgres": {"ok": True}}
+        try:
+            with (
+                self.backend._pool.connection() as connection,  # noqa: SLF001 - maintenance helper.
+                connection.cursor(row_factory=dict_row) as cursor,
+            ):
+                cursor.execute(
+                    """
+                    SELECT c.id, c.memory_id, c.chunk_index
+                    FROM ilma.memory_chunks c
+                    LEFT JOIN ilma.memories m ON m.id = c.memory_id
+                    WHERE m.id IS NULL
+                    ORDER BY c.id
+                    LIMIT 100
+                    """
+                )
+                orphan_rows = [dict(row) for row in cursor.fetchall()]
+                cursor.execute(
+                    """
+                    SELECT count(*) AS count
+                    FROM ilma.memory_chunks c
+                    LEFT JOIN ilma.memories m ON m.id = c.memory_id
+                    WHERE m.id IS NULL
+                    """
+                )
+                orphan_count = int(cursor.fetchone()["count"])
+                findings["orphaned_chunks"] = {"count": orphan_count, "rows": orphan_rows}
+
+                cursor.execute(
+                    """
+                    SELECT md5(content) AS content_hash,
+                           count(*) AS count,
+                           array_agg(id ORDER BY id) AS memory_ids
+                    FROM ilma.memories
+                    WHERE deleted_at IS NULL
+                    GROUP BY md5(content)
+                    HAVING count(*) > 1
+                    ORDER BY count(*) DESC, min(id)
+                    LIMIT 100
+                    """
+                )
+                duplicate_groups = [dict(row) for row in cursor.fetchall()]
+                findings["duplicate_memories"] = {
+                    "count": len(duplicate_groups),
+                    "groups": duplicate_groups,
+                }
+
+                cursor.execute(
+                    """
+                    SELECT c.relname
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'ilma' AND c.relname = ANY(%s)
+                    """,
+                    (list(FTS_INDEXES),),
+                )
+                existing = sorted(str(row["relname"]) for row in cursor.fetchall())
+                findings["fts_indexes"] = {
+                    "existing": existing,
+                    "missing": [name for name in FTS_INDEXES if name not in existing],
+                }
+                findings["vacuum_analyze"] = {
+                    "tables": ["memories", "memory_chunks"],
+                    "pending": True,
+                }
+        except Exception as exc:
+            findings["postgres"] = {
+                "ok": False,
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+            }
+        return findings
+
+    def _repair_apply(self, findings: Mapping[str, Any]) -> dict[str, Any]:
+        if not self._has_pg_pool():
+            return {"skipped": "backend does not expose a Postgres pool"}
+
+        actions: dict[str, Any] = {
+            "deleted_orphaned_chunks": 0,
+            "reindexed": [],
+            "vacuum_analyze": [],
+        }
+        with self.backend._pool.connection() as connection:  # noqa: SLF001 - maintenance helper.
+            orphaned = findings.get("orphaned_chunks", {})
+            if isinstance(orphaned, Mapping) and int(orphaned.get("count", 0) or 0) > 0:
+                row = connection.execute(
+                    """
+                    DELETE FROM ilma.memory_chunks c
+                    WHERE NOT EXISTS (SELECT 1 FROM ilma.memories m WHERE m.id = c.memory_id)
+                    RETURNING c.id
+                    """
+                ).fetchall()
+                actions["deleted_orphaned_chunks"] = len(row)
+
+            fts = findings.get("fts_indexes", {})
+            existing_indexes = fts.get("existing", []) if isinstance(fts, Mapping) else []
+            for index_name in existing_indexes:
+                if index_name not in FTS_INDEXES:
+                    continue
+                connection.execute(f"REINDEX INDEX ilma.{index_name}")
+                actions["reindexed"].append(index_name)
+
+        with self.backend._pool.connection() as connection:  # noqa: SLF001 - maintenance helper.
+            previous_autocommit = connection.autocommit
+            connection.autocommit = True
+            try:
+                for table_name in ("memories", "memory_chunks"):
+                    connection.execute(f"VACUUM (ANALYZE) ilma.{table_name}")
+                    actions["vacuum_analyze"].append(table_name)
+            finally:
+                connection.autocommit = previous_autocommit
+        return actions
+
+    def _doctor_backend(self) -> dict[str, Any]:
+        try:
+            return cast(dict[str, Any], self.backend.health())
+        except Exception as exc:
+            return {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+
+    def _doctor_pgvector(self) -> dict[str, Any]:
+        if self._has_pg_pool():
+            try:
+                with self.backend._pool.connection() as connection:  # noqa: SLF001 - health helper.
+                    row = connection.execute(
+                        "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')"
+                    ).fetchone()
+                return {"ok": bool(row and row[0]), "installed": bool(row and row[0])}
+            except Exception as exc:
+                return {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+        backend = self._doctor_backend()
+        installed = bool(backend.get("pgvector", False))
+        return {"ok": installed, "installed": installed, "source": "backend.health"}
+
+    def _doctor_pool(self) -> dict[str, Any]:
+        if not self._has_pg_pool():
+            return {"ok": True, "configured": False, "skipped": "backend has no Postgres pool"}
+        try:
+            pool = self.backend._pool  # noqa: SLF001 - health helper.
+            with pool.connection() as connection:
+                row = connection.execute("SELECT 1").fetchone()
+            stats_fn = getattr(pool, "get_stats", None)
+            stats = stats_fn() if callable(stats_fn) else {}
+            return {"ok": row is not None and row[0] == 1, "configured": True, "stats": stats}
+        except Exception as exc:
+            return {
+                "ok": False,
+                "configured": True,
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+            }
+
+    def _doctor_embedding_dimensions(self) -> dict[str, Any]:
+        dims: dict[str, int] = {}
+        for surface, repo in {"memory": self.memory, "wiki": self.wiki}.items():
+            dim = getattr(repo, "default_dim", None)
+            if dim is not None:
+                dims[surface] = int(dim)
+        unsupported = {surface: dim for surface, dim in dims.items() if dim not in SUPPORTED_DIMS}
+        columns: dict[str, bool] = {}
+        if self._has_pg_pool() and dims:
+            try:
+                expected_columns = [f"vector_{dim}" for dim in sorted(set(dims.values()))]
+                with (
+                    self.backend._pool.connection() as connection,  # noqa: SLF001 - health helper.
+                    connection.cursor(row_factory=dict_row) as cursor,
+                ):
+                    cursor.execute(
+                        """
+                        SELECT table_name, column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = 'ilma'
+                          AND table_name = ANY(%s)
+                          AND column_name = ANY(%s)
+                        """,
+                        (
+                            ["memories", "memory_chunks", "wiki_docs", "wiki_chunks"],
+                            expected_columns,
+                        ),
+                    )
+                    present = {(row["table_name"], row["column_name"]) for row in cursor.fetchall()}
+                for table_name in ("memories", "memory_chunks"):
+                    if "memory" in dims:
+                        columns[f"{table_name}.vector_{dims['memory']}"] = (
+                            table_name,
+                            f"vector_{dims['memory']}",
+                        ) in present
+                for table_name in ("wiki_chunks",):
+                    if "wiki" in dims:
+                        columns[f"{table_name}.vector_{dims['wiki']}"] = (
+                            table_name,
+                            f"vector_{dims['wiki']}",
+                        ) in present
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "dimensions": dims,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                }
+        ok = not unsupported and all(columns.values()) if columns else not unsupported
+        return {
+            "ok": ok,
+            "dimensions": dims,
+            "supported_dimensions": list(SUPPORTED_DIMS),
+            "unsupported": unsupported,
+            "columns": columns,
+        }
+
+    def _doctor_surfaces(self) -> dict[str, Any]:
+        if not self._has_pg_pool():
+            checks: dict[str, Any] = {}
+            for name, repo in self._surface_repos().items():
+                try:
+                    initializer = getattr(repo, "initialize_schema", None)
+                    if callable(initializer):
+                        initializer()
+                    checks[name] = {"ok": True, "checked": "initializer"}
+                except Exception as exc:
+                    checks[name] = {
+                        "ok": False,
+                        "error": {"type": type(exc).__name__, "message": str(exc)},
+                    }
+            return checks
+
+        try:
+            table_names = sorted({table for tables in SURFACE_TABLES.values() for table in tables})
+            with (
+                self.backend._pool.connection() as connection,  # noqa: SLF001 - health helper.
+                connection.cursor(row_factory=dict_row) as cursor,
+            ):
+                cursor.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'ilma' AND table_name = ANY(%s)
+                    """,
+                    (table_names,),
+                )
+                present = {str(row["table_name"]) for row in cursor.fetchall()}
+            return {
+                surface: {
+                    "ok": all(table in present for table in tables),
+                    "tables": {table: table in present for table in tables},
+                }
+                for surface, tables in SURFACE_TABLES.items()
+            }
+        except Exception as exc:
+            return {
+                surface: {
+                    "ok": False,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                }
+                for surface in SURFACE_TABLES
+            }
+
+    def _doctor_audit_log(self) -> dict[str, Any]:
+        if isinstance(self.audit, InMemoryAuditLogger):
+            return {"ok": True, "type": "in_memory"}
+        if not self._has_pg_pool():
+            return {"ok": True, "skipped": "backend has no Postgres pool"}
+        try:
+            with self.backend._pool.connection() as connection:  # noqa: SLF001 - health helper.
+                row = connection.execute(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = 'ilma' AND table_name = 'audit_log'
+                    )
+                    """
+                ).fetchone()
+            return {"ok": bool(row and row[0]), "table_exists": bool(row and row[0])}
+        except Exception as exc:
+            return {"ok": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+
+    def _surface_repos(self) -> Mapping[str, Any]:
+        return {
+            "memory": self.memory,
+            "wiki": self.wiki,
+            "journal": self.journal,
+            "skills": self.skills,
+            "kanban": self.kanban,
+            "metrics": self.metrics,
+            "observability": self.observability,
+            "sessions": self.sessions,
+        }
+
+    def _audit_rows(
+        self,
+        *,
+        tool: str | None,
+        status: str | None,
+        start: datetime | None,
+        end: datetime | None,
+        limit: int,
+        offset_value: int,
+    ) -> list[dict[str, Any]]:
+        records = getattr(self.audit, "records", None)
+        if isinstance(records, list):
+            rows = [dict(record) for record in records]
+            if tool:
+                rows = [row for row in rows if row.get("tool_name") == tool]
+            if status:
+                rows = [row for row in rows if row.get("status") == status]
+            # In-memory audit records in tests do not have timestamps; date filters
+            # only apply to rows that carry created_at.
+            if start:
+                rows = [
+                    row
+                    for row in rows
+                    if not isinstance(row.get("created_at"), datetime) or row["created_at"] >= start
+                ]
+            if end:
+                rows = [
+                    row
+                    for row in rows
+                    if not isinstance(row.get("created_at"), datetime) or row["created_at"] <= end
+                ]
+            return rows[offset_value : offset_value + limit]
+
+        if not self._has_pg_pool():
+            return []
+        self.audit.initialize_schema()
+        sql = [
+            "SELECT id, operation_id, tool_name, surface, action, payload, status, ",
+            "error_type, error_message, result, created_at, completed_at ",
+            "FROM ilma.audit_log WHERE true ",
+        ]
+        params: list[Any] = []
+        if tool:
+            sql.append("AND tool_name = %s ")
+            params.append(tool)
+        if status:
+            sql.append("AND status = %s ")
+            params.append(status)
+        if start:
+            sql.append("AND created_at >= %s ")
+            params.append(start)
+        if end:
+            sql.append("AND created_at <= %s ")
+            params.append(end)
+        sql.append("ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s")
+        params.extend([limit, offset_value])
+        with (
+            self.backend._pool.connection() as connection,  # noqa: SLF001 - audit query helper.
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute("".join(sql), params)
+            return [dict(row) for row in cursor.fetchall()]
 
     def _initialize_all(self) -> None:
         backend_init = getattr(self.backend, "initialize_schema", None)
@@ -1167,9 +1582,9 @@ def create_mcp_server(service: IlmaMcpService | None = None) -> FastMCP:
         return get_service().ilma_session_get(session_id, limit)
 
     @server.tool()
-    def ilma_repair() -> dict[str, Any]:
-        """Repair/verify schemas for all surfaces and audit logging."""
-        return get_service().ilma_repair()
+    def ilma_repair(force: bool = False) -> dict[str, Any]:
+        """Inspect storage damage and optionally repair safe Postgres issues."""
+        return get_service().ilma_repair(force=force)
 
     @server.tool()
     def ilma_doctor() -> dict[str, Any]:

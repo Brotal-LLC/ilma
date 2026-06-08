@@ -66,9 +66,50 @@ class FakeService:
             },
         }
 
-    def ilma_repair(self) -> dict[str, Any]:
-        self.calls.append(("repair", ()))
-        return {"ok": True, "repaired": True, "message": "schemas and audit log verified"}
+    def ilma_repair(self, force: bool = False) -> dict[str, Any]:
+        self.calls.append(("repair", (force,)))
+        return {
+            "ok": True,
+            "repaired": force,
+            "force": force,
+            "message": "repair complete" if force else "repair dry-run complete",
+            "findings": {
+                "orphaned_chunks": {"count": 0},
+                "duplicate_memories": {"count": 0},
+                "fts_indexes": {"missing": []},
+            },
+        }
+
+    def ilma_audit(
+        self,
+        *,
+        tool: str | None = None,
+        status: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        self.calls.append(("audit", (tool, status, start, end, limit, offset)))
+        return {
+            "ok": True,
+            "results": [
+                {
+                    "id": 1,
+                    "operation_id": "op-1",
+                    "tool_name": tool or "ilma_remember",
+                    "surface": "memory",
+                    "action": "remember",
+                    "status": status or "succeeded",
+                    "payload": {"content": "hello"},
+                    "result": {"memory_id": 1},
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "completed_at": "2026-01-01T00:00:01+00:00",
+                    "error_type": None,
+                    "error_message": None,
+                }
+            ],
+        }
 
     def ilma_migrate(self) -> dict[str, Any]:
         self.calls.append(("migrate", ()))
@@ -136,7 +177,9 @@ def test_help_lists_required_commands() -> None:
         "serve",
         "mcp",
         "repair",
+        "audit",
         "migrate",
+        "migrate-config",
     ]:
         assert command in result.output
 
@@ -183,18 +226,33 @@ def test_memory_commands_call_service_and_render_human_output(monkeypatch: Any) 
     assert service.calls[-1] == ("forget", (1,))
 
 
-def test_repair_and_migrate_json(monkeypatch: Any) -> None:
+def test_repair_migrate_and_audit_json(monkeypatch: Any) -> None:
     service = FakeService()
     monkeypatch.setattr(cli, "_service_from_env", lambda: service)
+    monkeypatch.setattr(
+        cli, "_dsn_from_env", lambda: (_ for _ in ()).throw(cli.IlmaConfigError("unset"))
+    )
 
-    repair_result = runner.invoke(cli.app, ["repair", "--json"])
+    repair_result = runner.invoke(cli.app, ["repair", "--force", "--json"])
     assert repair_result.exit_code == 0
     assert json.loads(repair_result.output)["repaired"] is True
+
+    audit_result = runner.invoke(
+        cli.app,
+        ["audit", "--tool", "ilma_remember", "--status", "succeeded", "--format", "json"],
+    )
+    assert audit_result.exit_code == 0
+    audit_payload = json.loads(audit_result.output)
+    assert audit_payload["results"][0]["tool_name"] == "ilma_remember"
 
     migrate_result = runner.invoke(cli.app, ["migrate", "--json"])
     assert migrate_result.exit_code == 0
     assert json.loads(migrate_result.output)["migrated"] is True
-    assert service.calls[-2:] == [("repair", ()), ("migrate", ())]
+    assert service.calls[-3:] == [
+        ("repair", (True,)),
+        ("audit", ("ilma_remember", "succeeded", None, None, 100, 0)),
+        ("migrate", ()),
+    ]
 
 
 def test_failed_service_result_exits_nonzero(monkeypatch: Any) -> None:
