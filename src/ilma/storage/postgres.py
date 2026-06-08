@@ -18,6 +18,8 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from ilma.chunking import chunk_text
+from ilma.core.journal import JournalEntry, JournalRepo
+from ilma.core.kanban import KanbanRepo, Task
 from ilma.core.memory import (
     MEMORY_MAX_CHARS,
     Memory,
@@ -26,6 +28,11 @@ from ilma.core.memory import (
     RoutingRuleViolationError,
     routing_rule_message,
 )
+from ilma.core.metrics import Metric, MetricsRepo
+from ilma.core.observability import ObservabilityRepo, Observation
+from ilma.core.sessions import SessionMessage, SessionsRepo
+from ilma.core.skills import Skill, SkillsRepo
+from ilma.core.wiki import WikiDoc, WikiRepo
 from ilma.embeddings import DEFAULT_DIM, SUPPORTED_DIMS, EmbedderRegistry
 from ilma.storage.base import StorageBackend
 
@@ -63,7 +70,7 @@ def close_all_pools() -> None:
 
 
 @contextmanager
-def _conn(dsn: str, *, min_size: int = 1, max_size: int = 8):
+def _conn(dsn: str, *, min_size: int = 1, max_size: int = 8) -> Any:
     pool = _get_pool(dsn, min_size=min_size, max_size=max_size)
     with pool.connection() as connection:
         yield connection
@@ -449,6 +456,1081 @@ class PgMemoryRepo(MemoryRepo):
         return results
 
 
+class _PgRepoMixin:
+    """Shared constructor/schema helper for the surface-specific PG repos."""
+
+    def initialize_schema(self) -> None:
+        raise NotImplementedError
+
+    def _init_pg_repo(
+        self,
+        dsn: str,
+        *,
+        min_pool_size: int = 1,
+        max_pool_size: int = 8,
+        initialize: bool = True,
+    ) -> None:
+        self._dsn = dsn
+        self._min_pool_size = min_pool_size
+        self._max_pool_size = max_pool_size
+        self._pool = _get_pool(dsn, min_size=min_pool_size, max_size=max_pool_size)
+        if initialize:
+            self.initialize_schema()
+        with self._pool.connection() as connection:
+            connection.execute("SELECT 1")
+
+    def _ensure_schema(self, *, vector: bool = False) -> None:
+        with self._pool.connection() as connection:
+            if vector:
+                connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            connection.execute("CREATE SCHEMA IF NOT EXISTS ilma")
+
+
+def _as_datetime(value: Any) -> datetime | None:
+    return value if isinstance(value, datetime) else None
+
+
+def _bucket_to_pg_unit(bucket: str) -> str:
+    """Translate human bucket strings to Postgres date_trunc units."""
+    b = bucket.strip().lower()
+    if b.endswith(("minute", "minutes", "min", "mins")):
+        return "minute"
+    if b.endswith(("hour", "hours", "hr", "hrs")):
+        return "hour"
+    if b.endswith(("day", "days")):
+        return "day"
+    if b.endswith(("week", "weeks")):
+        return "week"
+    if b.endswith(("month", "months")):
+        return "month"
+    return "hour"
+
+
+class PgWikiRepo(_PgRepoMixin, WikiRepo):
+    """Postgres + pgvector implementation of the wiki surface."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        embedders: Any | None = None,
+        min_pool_size: int = 1,
+        max_pool_size: int = 8,
+        initialize: bool = True,
+    ) -> None:
+        self._embedders = embedders or EmbedderRegistry.from_env()
+        self.default_dim = int(getattr(self._embedders, "default_dim", DEFAULT_DIM))
+        _vector_col(self.default_dim)
+        self._init_pg_repo(
+            dsn,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size,
+            initialize=initialize,
+        )
+
+    def initialize_schema(self) -> None:
+        self._ensure_schema(vector=True)
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ilma.wiki_docs (
+                    id bigserial PRIMARY KEY,
+                    slug text NOT NULL UNIQUE,
+                    title text NOT NULL,
+                    body_md text NOT NULL,
+                    category text,
+                    tags text[] NOT NULL DEFAULT '{}',
+                    source_uri text,
+                    version integer NOT NULL DEFAULT 1,
+                    metadata jsonb NOT NULL DEFAULT '{}',
+                    content_tsv tsvector GENERATED ALWAYS AS
+                        (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(body_md, ''))) STORED,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ilma.wiki_chunks (
+                    id bigserial PRIMARY KEY,
+                    doc_id bigint NOT NULL REFERENCES ilma.wiki_docs(id) ON DELETE CASCADE,
+                    chunk_index integer NOT NULL,
+                    content text NOT NULL,
+                    token_count integer NOT NULL,
+                    vector_768 vector(768),
+                    vector_1024 vector(1024),
+                    vector_1536 vector(1536),
+                    content_tsv tsvector GENERATED ALWAYS AS
+                        (to_tsvector('english', coalesce(content, ''))) STORED,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    UNIQUE(doc_id, chunk_index)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS wiki_docs_slug_idx ON ilma.wiki_docs(slug)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS wiki_docs_content_tsv_idx ON ilma.wiki_docs USING gin(content_tsv)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS wiki_chunks_doc_id_idx ON ilma.wiki_chunks(doc_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS wiki_chunks_content_tsv_idx ON ilma.wiki_chunks USING gin(content_tsv)"
+            )
+
+    def ingest(
+        self,
+        slug: str,
+        title: str,
+        body_md: str,
+        *,
+        category: str | None = None,
+        tags: list[str] | None = None,
+        source_uri: str | None = None,
+    ) -> dict[str, Any]:
+        if not slug.strip() or not title.strip():
+            raise ValueError("slug and title are required")
+        vector_col = _vector_col(self.default_dim)
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                INSERT INTO ilma.wiki_docs (slug, title, body_md, category, tags, source_uri)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (slug) DO UPDATE
+                SET title = EXCLUDED.title,
+                    body_md = EXCLUDED.body_md,
+                    category = EXCLUDED.category,
+                    tags = EXCLUDED.tags,
+                    source_uri = EXCLUDED.source_uri,
+                    version = ilma.wiki_docs.version + 1,
+                    updated_at = now()
+                RETURNING id, version
+                """,
+                (slug, title, body_md, category, tags or [], source_uri),
+            ).fetchone()
+            assert row is not None
+            doc_id = int(row[0])
+            version = int(row[1])
+            connection.execute("DELETE FROM ilma.wiki_chunks WHERE doc_id = %s", (doc_id,))
+            chunks = chunk_text(f"{title}\n\n{body_md}")
+            for chunk in chunks:
+                embedding = self._embedders.embed(chunk.text, dim=self.default_dim)
+                connection.execute(
+                    f"""
+                    INSERT INTO ilma.wiki_chunks
+                        (doc_id, chunk_index, content, token_count, {vector_col})
+                    VALUES (%s, %s, %s, %s, %s::vector)
+                    """,
+                    (
+                        doc_id,
+                        chunk.index,
+                        chunk.text,
+                        chunk.token_count,
+                        _vector_literal(embedding),
+                    ),
+                )
+        return {"document_id": doc_id, "version_id": version, "chunks": len(chunks)}
+
+    def get(self, slug: str) -> WikiDoc | None:
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT id, slug, title, body_md, category, tags, source_uri,
+                       version, created_at, updated_at, metadata
+                FROM ilma.wiki_docs
+                WHERE slug = %s
+                """,
+                (slug,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return WikiDoc(
+            id=int(row["id"]),
+            slug=str(row["slug"]),
+            title=str(row["title"]),
+            body_md=str(row["body_md"]),
+            category=row["category"],
+            tags=tuple(row["tags"] or ()),
+            source_uri=row["source_uri"],
+            version=int(row["version"]),
+            created_at=_as_datetime(row["created_at"]),
+            updated_at=_as_datetime(row["updated_at"]),
+            metadata=dict(row["metadata"] or {}),
+        )
+
+    def search(self, query: str, *, top_k: int = 5) -> list[dict[str, Any]]:
+        if not query.strip() or top_k <= 0:
+            return []
+        vector_col = _vector_col(self.default_dim)
+        query_vector = _vector_literal(self._embedders.embed(query, dim=self.default_dim))
+        limit = max(top_k * 4, top_k)
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT id, ts_rank_cd(content_tsv, plainto_tsquery('english', %s)) AS score
+                FROM ilma.wiki_docs
+                WHERE content_tsv @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC
+                LIMIT %s
+                """,
+                (query, query, limit),
+            )
+            doc_fts = {int(row["id"]): float(row["score"] or 0.0) for row in cursor.fetchall()}
+            cursor.execute(
+                """
+                SELECT doc_id, max(ts_rank_cd(content_tsv, plainto_tsquery('english', %s))) AS score
+                FROM ilma.wiki_chunks
+                WHERE content_tsv @@ plainto_tsquery('english', %s)
+                GROUP BY doc_id
+                ORDER BY score DESC
+                LIMIT %s
+                """,
+                (query, query, limit),
+            )
+            chunk_fts = {
+                int(row["doc_id"]): float(row["score"] or 0.0) for row in cursor.fetchall()
+            }
+            cursor.execute(
+                f"""
+                SELECT doc_id, max(1 - ({vector_col} <=> %s::vector)) AS score
+                FROM ilma.wiki_chunks
+                WHERE {vector_col} IS NOT NULL
+                GROUP BY doc_id
+                ORDER BY min({vector_col} <=> %s::vector)
+                LIMIT %s
+                """,
+                (query_vector, query_vector, limit),
+            )
+            vectors = {int(row["doc_id"]): float(row["score"] or 0.0) for row in cursor.fetchall()}
+            doc_ids = set(doc_fts) | set(chunk_fts) | set(vectors)
+            scored = {
+                doc_id: doc_fts.get(doc_id, 0.0)
+                + 0.75 * chunk_fts.get(doc_id, 0.0)
+                + vectors.get(doc_id, 0.0)
+                for doc_id in doc_ids
+            }
+            top = sorted(scored.items(), key=lambda item: (-item[1], item[0]))[:top_k]
+            if not top:
+                return []
+            cursor.execute(
+                """
+                SELECT id, slug, title, body_md, category, tags, source_uri, version,
+                       created_at, updated_at, metadata
+                FROM ilma.wiki_docs
+                WHERE id = ANY(%s)
+                """,
+                ([doc_id for doc_id, _score in top],),
+            )
+            docs = {int(row["id"]): row for row in cursor.fetchall()}
+        results: list[dict[str, Any]] = []
+        for doc_id, score in top:
+            row = docs.get(doc_id)
+            if row is None:
+                continue
+            results.append(
+                {
+                    "id": doc_id,
+                    "document_id": doc_id,
+                    "slug": row["slug"],
+                    "title": row["title"],
+                    "category": row["category"],
+                    "tags": tuple(row["tags"] or ()),
+                    "source_uri": row["source_uri"],
+                    "version": int(row["version"]),
+                    "score": float(score),
+                    "snippet": str(row["body_md"])[:240],
+                    "metadata": dict(row["metadata"] or {}),
+                }
+            )
+        return results
+
+    def suggest_links(self, doc_id: int, *, top_k: int = 5) -> list[dict[str, Any]]:
+        if doc_id <= 0 or top_k <= 0:
+            return []
+        vector_col = _vector_col(self.default_dim)
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                f"""
+                WITH query_chunk AS (
+                    SELECT {vector_col} AS embedding
+                    FROM ilma.wiki_chunks
+                    WHERE doc_id = %s AND {vector_col} IS NOT NULL
+                    ORDER BY chunk_index
+                    LIMIT 1
+                )
+                SELECT d.id, d.slug, d.title,
+                       max(1 - (c.{vector_col} <=> q.embedding)) AS score
+                FROM query_chunk q
+                JOIN ilma.wiki_chunks c ON c.{vector_col} IS NOT NULL
+                JOIN ilma.wiki_docs d ON d.id = c.doc_id
+                WHERE d.id <> %s
+                GROUP BY d.id, d.slug, d.title
+                ORDER BY min(c.{vector_col} <=> q.embedding), d.id
+                LIMIT %s
+                """,
+                (doc_id, doc_id, top_k),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+class PgJournalRepo(_PgRepoMixin, JournalRepo):
+    """Postgres implementation of the journal surface."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        min_pool_size: int = 1,
+        max_pool_size: int = 8,
+        initialize: bool = True,
+    ) -> None:
+        self._init_pg_repo(
+            dsn,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size,
+            initialize=initialize,
+        )
+
+    def initialize_schema(self) -> None:
+        self._ensure_schema()
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ilma.journal_entries (
+                    id bigserial PRIMARY KEY,
+                    content text NOT NULL,
+                    tags text[] NOT NULL DEFAULT '{}',
+                    content_tsv tsvector GENERATED ALWAYS AS
+                        (to_tsvector('english', coalesce(content, ''))) STORED,
+                    created_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS journal_entries_content_tsv_idx ON ilma.journal_entries USING gin(content_tsv)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS journal_entries_created_at_idx ON ilma.journal_entries(created_at DESC)"
+            )
+
+    def append(self, content: str, *, tags: list[str] | None = None) -> int:
+        if not content.strip():
+            raise ValueError("content is required")
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "INSERT INTO ilma.journal_entries (content, tags) VALUES (%s, %s) RETURNING id",
+                (content, tags or []),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def search(self, query: str, *, top_k: int = 10) -> list[JournalEntry]:
+        if not query.strip() or top_k <= 0:
+            return []
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT id, content, tags, created_at,
+                       ts_rank_cd(content_tsv, plainto_tsquery('english', %s)) AS score
+                FROM ilma.journal_entries
+                WHERE content_tsv @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC, created_at DESC
+                LIMIT %s
+                """,
+                (query, query, top_k),
+            )
+            return [
+                JournalEntry(
+                    id=int(row["id"]),
+                    content=str(row["content"]),
+                    tags=tuple(row["tags"] or ()),
+                    created_at=_as_datetime(row["created_at"]),
+                )
+                for row in cursor.fetchall()
+            ]
+
+    def recent(self, *, limit: int = 10) -> list[JournalEntry]:
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT id, content, tags, created_at
+                FROM ilma.journal_entries
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return [
+                JournalEntry(
+                    id=int(row["id"]),
+                    content=str(row["content"]),
+                    tags=tuple(row["tags"] or ()),
+                    created_at=_as_datetime(row["created_at"]),
+                )
+                for row in cursor.fetchall()
+            ]
+
+
+class PgSkillsRepo(_PgRepoMixin, SkillsRepo):
+    """Postgres implementation of the skills surface."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        min_pool_size: int = 1,
+        max_pool_size: int = 8,
+        initialize: bool = True,
+    ) -> None:
+        self._init_pg_repo(
+            dsn,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size,
+            initialize=initialize,
+        )
+
+    def initialize_schema(self) -> None:
+        self._ensure_schema()
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ilma.skills (
+                    id bigserial PRIMARY KEY,
+                    name text NOT NULL UNIQUE,
+                    content text NOT NULL,
+                    category text,
+                    tags text[] NOT NULL DEFAULT '{}',
+                    body_tsv tsvector GENERATED ALWAYS AS
+                        (to_tsvector('english', coalesce(name, '') || ' ' || coalesce(content, '') || ' ' || coalesce(category, ''))) STORED,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            connection.execute("CREATE INDEX IF NOT EXISTS skills_name_idx ON ilma.skills(name)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS skills_body_tsv_idx ON ilma.skills USING gin(body_tsv)"
+            )
+
+    def upsert(
+        self, name: str, content: str, *, category: str | None = None, tags: list[str] | None = None
+    ) -> int:
+        if not name.strip() or not content.strip():
+            raise ValueError("name and content are required")
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                INSERT INTO ilma.skills (name, content, category, tags)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (name) DO UPDATE
+                SET content = EXCLUDED.content,
+                    category = EXCLUDED.category,
+                    tags = EXCLUDED.tags,
+                    updated_at = now()
+                RETURNING id
+                """,
+                (name, content, category, tags or []),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def get(self, name: str) -> Skill | None:
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                "SELECT id, name, content, category, tags, updated_at FROM ilma.skills WHERE name = %s",
+                (name,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return Skill(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            content=str(row["content"]),
+            category=row["category"],
+            tags=tuple(row["tags"] or ()),
+            updated_at=_as_datetime(row["updated_at"]),
+        )
+
+    def search(self, query: str, *, top_k: int = 5) -> list[Skill]:
+        if not query.strip() or top_k <= 0:
+            return []
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT id, name, content, category, tags, updated_at,
+                       ts_rank_cd(body_tsv, plainto_tsquery('english', %s)) AS score
+                FROM ilma.skills
+                WHERE body_tsv @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC, updated_at DESC
+                LIMIT %s
+                """,
+                (query, query, top_k),
+            )
+            return [
+                Skill(
+                    id=int(row["id"]),
+                    name=str(row["name"]),
+                    content=str(row["content"]),
+                    category=row["category"],
+                    tags=tuple(row["tags"] or ()),
+                    updated_at=_as_datetime(row["updated_at"]),
+                )
+                for row in cursor.fetchall()
+            ]
+
+
+class PgMetricsRepo(_PgRepoMixin, MetricsRepo):
+    """Postgres implementation of the metrics surface."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        min_pool_size: int = 1,
+        max_pool_size: int = 8,
+        initialize: bool = True,
+    ) -> None:
+        self._init_pg_repo(
+            dsn,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size,
+            initialize=initialize,
+        )
+
+    def initialize_schema(self) -> None:
+        self._ensure_schema()
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ilma.metrics (
+                    id bigserial PRIMARY KEY,
+                    name text NOT NULL,
+                    value double precision NOT NULL,
+                    labels jsonb NOT NULL DEFAULT '{}',
+                    recorded_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS metrics_name_time_idx ON ilma.metrics(name, recorded_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS metrics_labels_idx ON ilma.metrics USING gin(labels)"
+            )
+
+    def record(self, name: str, value: float, *, labels: dict[str, str] | None = None) -> int:
+        if not name.strip():
+            raise ValueError("name is required")
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "INSERT INTO ilma.metrics (name, value, labels) VALUES (%s, %s, %s) RETURNING id",
+                (name, float(value), _jsonb(labels or {})),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def query(
+        self,
+        name: str,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Metric]:
+        sql = ["SELECT id, name, value, labels, recorded_at FROM ilma.metrics WHERE name = %s "]
+        params: list[Any] = [name]
+        if start is not None:
+            sql.append("AND recorded_at >= %s ")
+            params.append(start)
+        if end is not None:
+            sql.append("AND recorded_at <= %s ")
+            params.append(end)
+        sql.append("ORDER BY recorded_at DESC, id DESC LIMIT %s")
+        params.append(limit)
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute("".join(sql), params)
+            return [
+                Metric(
+                    id=int(row["id"]),
+                    name=str(row["name"]),
+                    value=float(row["value"]),
+                    labels={str(k): str(v) for k, v in dict(row["labels"] or {}).items()},
+                    recorded_at=row["recorded_at"],
+                )
+                for row in cursor.fetchall()
+            ]
+
+    def aggregate(self, name: str, *, window: str = "1 hour") -> list[dict[str, Any]]:
+        unit = _bucket_to_pg_unit(window)
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT date_trunc(%s, recorded_at) AS window_start,
+                       count(*) AS count,
+                       avg(value) AS avg,
+                       min(value) AS min,
+                       max(value) AS max,
+                       percentile_cont(0.5) WITHIN GROUP (ORDER BY value) AS p50
+                FROM ilma.metrics
+                WHERE name = %s
+                GROUP BY window_start
+                ORDER BY window_start
+                """,
+                (unit, name),
+            )
+            return [
+                {
+                    "window_start": row["window_start"],
+                    "count": int(row["count"]),
+                    "avg": float(row["avg"] or 0.0),
+                    "min": float(row["min"] or 0.0),
+                    "max": float(row["max"] or 0.0),
+                    "p50": float(row["p50"] or 0.0),
+                }
+                for row in cursor.fetchall()
+            ]
+
+
+class PgKanbanRepo(_PgRepoMixin, KanbanRepo):
+    """Postgres implementation of the kanban surface."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        min_pool_size: int = 1,
+        max_pool_size: int = 8,
+        initialize: bool = True,
+    ) -> None:
+        self._init_pg_repo(
+            dsn,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size,
+            initialize=initialize,
+        )
+
+    def initialize_schema(self) -> None:
+        self._ensure_schema()
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ilma.kanban_tasks (
+                    id bigserial PRIMARY KEY,
+                    title text NOT NULL,
+                    description text NOT NULL DEFAULT '',
+                    status text NOT NULL DEFAULT 'todo',
+                    priority integer NOT NULL DEFAULT 0,
+                    tags text[] NOT NULL DEFAULT '{}',
+                    parent_id bigint REFERENCES ilma.kanban_tasks(id) ON DELETE SET NULL,
+                    metadata jsonb NOT NULL DEFAULT '{}',
+                    content_tsv tsvector GENERATED ALWAYS AS
+                        (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(description, ''))) STORED,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS kanban_tasks_status_idx ON ilma.kanban_tasks(status)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS kanban_tasks_content_tsv_idx ON ilma.kanban_tasks USING gin(content_tsv)"
+            )
+
+    def create(
+        self,
+        title: str,
+        *,
+        description: str = "",
+        status: str = "todo",
+        priority: int = 0,
+        tags: list[str] | None = None,
+        parent_id: int | None = None,
+    ) -> int:
+        if not title.strip():
+            raise ValueError("title is required")
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                INSERT INTO ilma.kanban_tasks
+                    (title, description, status, priority, tags, parent_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (title, description, status, int(priority), tags or [], parent_id),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def get(self, task_id: int) -> Task | None:
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT id, title, description, status, priority, tags, parent_id,
+                       created_at, updated_at, metadata
+                FROM ilma.kanban_tasks WHERE id = %s
+                """,
+                (task_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return self._task_from_row(row)
+
+    def update(self, task_id: int, **kwargs: Any) -> bool:
+        allowed = {"title", "description", "status", "priority", "tags", "parent_id", "metadata"}
+        updates: list[str] = []
+        params: list[Any] = []
+        for key, value in kwargs.items():
+            if key not in allowed:
+                continue
+            updates.append(f"{key} = %s")
+            if key == "metadata":
+                params.append(_jsonb(value or {}))
+            elif key == "tags":
+                params.append(value or [])
+            else:
+                params.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = now()")
+        params.append(task_id)
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                f"UPDATE ilma.kanban_tasks SET {', '.join(updates)} WHERE id = %s RETURNING id",
+                params,
+            ).fetchone()
+        return row is not None
+
+    def complete(self, task_id: int) -> bool:
+        return self.update(task_id, status="done")
+
+    def list_by_status(self, status: str, *, limit: int = 50) -> list[Task]:
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT id, title, description, status, priority, tags, parent_id,
+                       created_at, updated_at, metadata
+                FROM ilma.kanban_tasks
+                WHERE status = %s
+                ORDER BY priority DESC, created_at, id
+                LIMIT %s
+                """,
+                (status, limit),
+            )
+            return [self._task_from_row(row) for row in cursor.fetchall()]
+
+    def search(self, query: str, *, top_k: int = 10) -> list[Task]:
+        if not query.strip() or top_k <= 0:
+            return []
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT id, title, description, status, priority, tags, parent_id,
+                       created_at, updated_at, metadata,
+                       ts_rank_cd(content_tsv, plainto_tsquery('english', %s)) AS score
+                FROM ilma.kanban_tasks
+                WHERE content_tsv @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC, priority DESC
+                LIMIT %s
+                """,
+                (query, query, top_k),
+            )
+            return [self._task_from_row(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def _task_from_row(row: Any) -> Task:
+        return Task(
+            id=int(row["id"]),
+            title=str(row["title"]),
+            description=str(row["description"] or ""),
+            status=str(row["status"]),
+            priority=int(row["priority"]),
+            tags=tuple(row["tags"] or ()),
+            parent_id=row["parent_id"],
+            created_at=_as_datetime(row["created_at"]),
+            updated_at=_as_datetime(row["updated_at"]),
+            metadata=dict(row["metadata"] or {}),
+        )
+
+
+class PgObservabilityRepo(_PgRepoMixin, ObservabilityRepo):
+    """Postgres implementation of the observability surface."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        min_pool_size: int = 1,
+        max_pool_size: int = 8,
+        initialize: bool = True,
+    ) -> None:
+        self._init_pg_repo(
+            dsn,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size,
+            initialize=initialize,
+        )
+
+    def initialize_schema(self) -> None:
+        self._ensure_schema()
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ilma.observations (
+                    id bigserial PRIMARY KEY,
+                    level text NOT NULL,
+                    message text NOT NULL,
+                    source text,
+                    context jsonb NOT NULL DEFAULT '{}',
+                    recorded_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS observations_query_idx ON ilma.observations(level, source, recorded_at DESC)"
+            )
+
+    def log(
+        self,
+        level: str,
+        message: str,
+        *,
+        source: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> int:
+        if not level.strip() or not message.strip():
+            raise ValueError("level and message are required")
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                INSERT INTO ilma.observations (level, message, source, context)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                """,
+                (level, message, source, _jsonb(context or {})),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def query(
+        self,
+        *,
+        level: str | None = None,
+        source: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Observation]:
+        sql = [
+            "SELECT id, level, message, source, context, recorded_at FROM ilma.observations WHERE true "
+        ]
+        params: list[Any] = []
+        if level is not None:
+            sql.append("AND level = %s ")
+            params.append(level)
+        if source is not None:
+            sql.append("AND source = %s ")
+            params.append(source)
+        if start is not None:
+            sql.append("AND recorded_at >= %s ")
+            params.append(start)
+        if end is not None:
+            sql.append("AND recorded_at <= %s ")
+            params.append(end)
+        sql.append("ORDER BY recorded_at DESC, id DESC LIMIT %s")
+        params.append(limit)
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute("".join(sql), params)
+            return [
+                Observation(
+                    id=int(row["id"]),
+                    level=str(row["level"]),
+                    message=str(row["message"]),
+                    source=row["source"],
+                    context=dict(row["context"] or {}),
+                    recorded_at=_as_datetime(row["recorded_at"]),
+                )
+                for row in cursor.fetchall()
+            ]
+
+
+class PgSessionsRepo(_PgRepoMixin, SessionsRepo):
+    """Postgres implementation of the sessions surface."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        min_pool_size: int = 1,
+        max_pool_size: int = 8,
+        initialize: bool = True,
+    ) -> None:
+        self._init_pg_repo(
+            dsn,
+            min_pool_size=min_pool_size,
+            max_pool_size=max_pool_size,
+            initialize=initialize,
+        )
+
+    def initialize_schema(self) -> None:
+        self._ensure_schema()
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ilma.sessions (
+                    session_id text PRIMARY KEY,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    updated_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ilma.session_messages (
+                    id bigserial PRIMARY KEY,
+                    session_id text NOT NULL REFERENCES ilma.sessions(session_id) ON DELETE CASCADE,
+                    role text NOT NULL,
+                    content text NOT NULL,
+                    content_tsv tsvector GENERATED ALWAYS AS
+                        (to_tsvector('english', coalesce(content, ''))) STORED,
+                    created_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_messages_session_idx ON ilma.session_messages(session_id, created_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS session_messages_content_tsv_idx ON ilma.session_messages USING gin(content_tsv)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS sessions_updated_at_idx ON ilma.sessions(updated_at DESC)"
+            )
+
+    def append(self, session_id: str, role: str, content: str) -> int:
+        if not session_id.strip() or not role.strip() or not content.strip():
+            raise ValueError("session_id, role, and content are required")
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO ilma.sessions (session_id)
+                VALUES (%s)
+                ON CONFLICT (session_id) DO UPDATE SET updated_at = now()
+                """,
+                (session_id,),
+            )
+            row = connection.execute(
+                """
+                INSERT INTO ilma.session_messages (session_id, role, content)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (session_id, role, content),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def get_session(self, session_id: str, *, limit: int = 100) -> list[SessionMessage]:
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT id, session_id, role, content, created_at
+                FROM ilma.session_messages
+                WHERE session_id = %s
+                ORDER BY created_at, id
+                LIMIT %s
+                """,
+                (session_id, limit),
+            )
+            return [self._message_from_row(row) for row in cursor.fetchall()]
+
+    def search(self, query: str, *, top_k: int = 10) -> list[SessionMessage]:
+        if not query.strip() or top_k <= 0:
+            return []
+        with (
+            self._pool.connection() as connection,
+            connection.cursor(row_factory=dict_row) as cursor,
+        ):
+            cursor.execute(
+                """
+                SELECT id, session_id, role, content, created_at,
+                       ts_rank_cd(content_tsv, plainto_tsquery('english', %s)) AS score
+                FROM ilma.session_messages
+                WHERE content_tsv @@ plainto_tsquery('english', %s)
+                ORDER BY score DESC, created_at DESC
+                LIMIT %s
+                """,
+                (query, query, top_k),
+            )
+            return [self._message_from_row(row) for row in cursor.fetchall()]
+
+    def recent_sessions(self, *, limit: int = 10) -> list[str]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                "SELECT session_id FROM ilma.sessions ORDER BY updated_at DESC, session_id LIMIT %s",
+                (limit,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    @staticmethod
+    def _message_from_row(row: Any) -> SessionMessage:
+        return SessionMessage(
+            id=int(row["id"]),
+            session_id=str(row["session_id"]),
+            role=str(row["role"]),
+            content=str(row["content"]),
+            created_at=row["created_at"],
+        )
+
+
 class PgBackend(StorageBackend):
     """Small generic pgvector backend implementing :class:`StorageBackend`."""
 
@@ -492,6 +1574,56 @@ class PgBackend(StorageBackend):
         return PgMemoryRepo(
             self._dsn,
             embedders=embedders,
+            min_pool_size=self._min_pool_size,
+            max_pool_size=self._max_pool_size,
+        )
+
+    def wiki_repo(self, *, embedders: Any | None = None) -> PgWikiRepo:
+        return PgWikiRepo(
+            self._dsn,
+            embedders=embedders,
+            min_pool_size=self._min_pool_size,
+            max_pool_size=self._max_pool_size,
+        )
+
+    def journal_repo(self) -> PgJournalRepo:
+        return PgJournalRepo(
+            self._dsn,
+            min_pool_size=self._min_pool_size,
+            max_pool_size=self._max_pool_size,
+        )
+
+    def skills_repo(self) -> PgSkillsRepo:
+        return PgSkillsRepo(
+            self._dsn,
+            min_pool_size=self._min_pool_size,
+            max_pool_size=self._max_pool_size,
+        )
+
+    def metrics_repo(self) -> PgMetricsRepo:
+        return PgMetricsRepo(
+            self._dsn,
+            min_pool_size=self._min_pool_size,
+            max_pool_size=self._max_pool_size,
+        )
+
+    def kanban_repo(self) -> PgKanbanRepo:
+        return PgKanbanRepo(
+            self._dsn,
+            min_pool_size=self._min_pool_size,
+            max_pool_size=self._max_pool_size,
+        )
+
+    def observability_repo(self) -> PgObservabilityRepo:
+        return PgObservabilityRepo(
+            self._dsn,
+            min_pool_size=self._min_pool_size,
+            max_pool_size=self._max_pool_size,
+        )
+
+    def sessions_repo(self) -> PgSessionsRepo:
+        return PgSessionsRepo(
+            self._dsn,
             min_pool_size=self._min_pool_size,
             max_pool_size=self._max_pool_size,
         )
@@ -648,4 +1780,15 @@ class PgBackend(StorageBackend):
             params.extend([key, str(value)])
 
 
-__all__ = ["PgBackend", "PgMemoryRepo", "close_all_pools"]
+__all__ = [
+    "PgBackend",
+    "PgJournalRepo",
+    "PgKanbanRepo",
+    "PgMemoryRepo",
+    "PgMetricsRepo",
+    "PgObservabilityRepo",
+    "PgSessionsRepo",
+    "PgSkillsRepo",
+    "PgWikiRepo",
+    "close_all_pools",
+]

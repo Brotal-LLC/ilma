@@ -177,3 +177,163 @@ def test_postgres_backend_is_framework_agnostic(clean_pg: str) -> None:
     import sys
 
     assert "hermes_memory" not in sys.modules
+
+
+def test_pg_wiki_repo_ingest_get_hybrid_search_and_suggest_links(clean_pg: str) -> None:
+    from ilma.storage.postgres import PgWikiRepo
+
+    repo = PgWikiRepo(clean_pg, embedders=FakeEmbedderRegistry(), min_pool_size=1, max_pool_size=4)
+    first = repo.ingest(
+        "postgres-memory",
+        "Postgres memory",
+        "Durable pgvector knowledge storage for agents.",
+        category="db",
+        tags=["postgres", "pgvector"],
+        source_uri="https://example.test/postgres",
+    )
+    second = repo.ingest(
+        "python-testing",
+        "Python testing",
+        "Testing notes for reliable Python agents.",
+        category="code",
+        tags=["python"],
+    )
+
+    assert first["document_id"] > 0
+    assert first["version_id"] == 1
+    assert first["chunks"] >= 1
+    assert second["document_id"] > 0
+
+    doc = repo.get("postgres-memory")
+    assert doc is not None
+    assert doc.slug == "postgres-memory"
+    assert doc.tags == ("postgres", "pgvector")
+    assert doc.source_uri == "https://example.test/postgres"
+
+    updated = repo.ingest("postgres-memory", "Postgres memory", "Updated pgvector docs")
+    assert updated["document_id"] == first["document_id"]
+    assert updated["version_id"] == 2
+
+    fts_results = repo.search("pgvector", top_k=2)
+    assert fts_results[0]["slug"] == "postgres-memory"
+
+    vector_results = repo.search("python", top_k=2)
+    assert vector_results[0]["slug"] == "python-testing"
+
+    suggestions = repo.suggest_links(first["document_id"], top_k=5)
+    assert {s["slug"] for s in suggestions} >= {"python-testing"}
+
+
+def test_pg_journal_repo_append_search_recent(clean_pg: str) -> None:
+    from ilma.storage.postgres import PgJournalRepo
+
+    repo = PgJournalRepo(clean_pg, min_pool_size=1, max_pool_size=4)
+    first_id = repo.append("Today I debugged a Postgres integration", tags=["db"])
+    second_id = repo.append("Wrote Python unit tests", tags=["code"])
+
+    assert first_id > 0
+    assert second_id > first_id
+    assert repo.search("Postgres", top_k=3)[0].id == first_id
+    recent = repo.recent(limit=2)
+    assert [entry.id for entry in recent] == [second_id, first_id]
+    assert recent[0].created_at is not None
+
+
+def test_pg_skills_repo_upsert_get_search(clean_pg: str) -> None:
+    from ilma.storage.postgres import PgSkillsRepo
+
+    repo = PgSkillsRepo(clean_pg, min_pool_size=1, max_pool_size=4)
+    skill_id = repo.upsert(
+        "postgres-debugging",
+        "Use psql and pgvector diagnostics to debug storage issues.",
+        category="database",
+        tags=["postgres"],
+    )
+    assert skill_id > 0
+    assert repo.upsert("postgres-debugging", "Updated pgvector troubleshooting guide") == skill_id
+
+    skill = repo.get("postgres-debugging")
+    assert skill is not None
+    assert skill.id == skill_id
+    assert skill.content == "Updated pgvector troubleshooting guide"
+    assert repo.search("troubleshooting", top_k=3)[0].name == "postgres-debugging"
+
+
+def test_pg_metrics_repo_record_query_aggregate(clean_pg: str) -> None:
+    from ilma.storage.postgres import PgMetricsRepo
+
+    repo = PgMetricsRepo(clean_pg, min_pool_size=1, max_pool_size=4)
+    first_id = repo.record("latency_ms", 10.0, labels={"route": "search"})
+    second_id = repo.record("latency_ms", 30.0, labels={"route": "search"})
+    repo.record("tokens", 100.0)
+
+    rows = repo.query("latency_ms", limit=10)
+    assert {row.id for row in rows} == {first_id, second_id}
+    assert rows[0].labels == {"route": "search"}
+    assert rows[0].recorded_at is not None
+
+    aggregates = repo.aggregate("latency_ms", window="1 hour")
+    assert len(aggregates) == 1
+    assert aggregates[0]["count"] == 2
+    assert aggregates[0]["avg"] == 20.0
+    assert aggregates[0]["min"] == 10.0
+    assert aggregates[0]["max"] == 30.0
+
+
+def test_pg_kanban_repo_create_get_update_complete_list_search(clean_pg: str) -> None:
+    from ilma.storage.postgres import PgKanbanRepo
+
+    repo = PgKanbanRepo(clean_pg, min_pool_size=1, max_pool_size=4)
+    parent_id = repo.create(
+        "Build Postgres backend",
+        description="Implement durable kanban storage",
+        priority=5,
+        tags=["db"],
+    )
+    child_id = repo.create(
+        "Write tests", description="Integration tests for kanban", parent_id=parent_id, priority=10
+    )
+
+    child = repo.get(child_id)
+    assert child is not None
+    assert child.parent_id == parent_id
+    assert child.status == "todo"
+
+    assert repo.update(child_id, status="in_progress", metadata={"owner": "agent"}) is True
+    assert repo.get(child_id).metadata == {"owner": "agent"}  # type: ignore[union-attr]
+    assert [task.id for task in repo.list_by_status("in_progress")] == [child_id]
+    assert repo.search("durable kanban", top_k=3)[0].id == parent_id
+    assert repo.complete(child_id) is True
+    assert repo.get(child_id).status == "done"  # type: ignore[union-attr]
+
+
+def test_pg_observability_repo_log_and_query(clean_pg: str) -> None:
+    from ilma.storage.postgres import PgObservabilityRepo
+
+    repo = PgObservabilityRepo(clean_pg, min_pool_size=1, max_pool_size=4)
+    info_id = repo.log("info", "started postgres integration", source="tests", context={"ok": True})
+    error_id = repo.log("error", "failed tool call", source="tools")
+
+    errors = repo.query(level="error")
+    assert [obs.id for obs in errors] == [error_id]
+    tests = repo.query(source="tests")
+    assert [obs.id for obs in tests] == [info_id]
+    assert tests[0].context == {"ok": True}
+    assert tests[0].recorded_at is not None
+
+
+def test_pg_sessions_repo_append_fetch_search_recent(clean_pg: str) -> None:
+    from ilma.storage.postgres import PgSessionsRepo
+
+    repo = PgSessionsRepo(clean_pg, min_pool_size=1, max_pool_size=4)
+    first_id = repo.append("session-a", "user", "Please debug Postgres storage")
+    second_id = repo.append("session-a", "assistant", "I will inspect pgvector tables")
+    repo.append("session-b", "user", "Unrelated Python question")
+
+    messages = repo.get_session("session-a")
+    assert [m.id for m in messages] == [first_id, second_id]
+    assert messages[0].session_id == "session-a"
+    assert messages[0].created_at is not None
+
+    assert repo.search("pgvector", top_k=3)[0].id == second_id
+    assert repo.recent_sessions(limit=2)[0] == "session-b"
