@@ -16,6 +16,8 @@ class FakeHttpService:
             {"id": 1, "content": "User prefers dark mode", "tags": [], "category": None}
         ]
         self.wiki_docs = {"intro": {"id": 1, "slug": "intro", "title": "Intro", "body_md": "Hello"}}
+        self.observability = self
+        self.access_logs: list[dict[str, Any]] = []
 
     def ilma_status(self) -> dict[str, Any]:
         return {
@@ -185,6 +187,19 @@ class FakeHttpService:
     ) -> dict[str, Any]:
         return {"ok": True, "observation_id": 11}
 
+    def log(
+        self,
+        level: str,
+        message: str,
+        *,
+        source: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> int:
+        self.access_logs.append(
+            {"level": level, "message": message, "source": source, "context": context or {}}
+        )
+        return len(self.access_logs)
+
     def ilma_obs_query(
         self,
         level: str | None = None,
@@ -212,7 +227,9 @@ class FakeHttpService:
 
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
+def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    monkeypatch.delenv("ILMA_API_KEY", raising=False)
+    monkeypatch.delenv("ILMA_RATE_LIMIT_RPS", raising=False)
     app = create_app(cast(Any, FakeHttpService()))
     with TestClient(app) as test_client:
         yield test_client
@@ -400,3 +417,54 @@ def test_http_returns_structured_service_errors(client: TestClient) -> None:
         "ok": False,
         "error": {"type": "ValueError", "message": "cannot remember boom"},
     }
+
+
+def test_api_key_auth_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ILMA_API_KEY", "secret")
+    monkeypatch.delenv("ILMA_RATE_LIMIT_RPS", raising=False)
+    app = create_app(cast(Any, FakeHttpService()))
+    with TestClient(app) as test_client:
+        assert test_client.get("/health").status_code == 200
+        assert test_client.get("/openapi.json").status_code == 200
+        assert test_client.get("/status").status_code == 401
+        assert test_client.get("/status", headers={"X-API-Key": "wrong"}).status_code == 401
+        assert test_client.get("/status", headers={"X-API-Key": "secret"}).status_code == 200
+    set_service(None)
+
+
+def test_rate_limit_and_health_exemption(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ILMA_API_KEY", raising=False)
+    monkeypatch.setenv("ILMA_RATE_LIMIT_RPS", "1")
+    app = create_app(cast(Any, FakeHttpService()))
+    with TestClient(app) as test_client:
+        assert test_client.get("/status").status_code == 200
+        assert test_client.get("/status").status_code == 429
+        assert test_client.get("/health").status_code == 200
+        assert test_client.get("/health").status_code == 200
+    set_service(None)
+
+
+def test_metrics_cors_and_access_logging(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ILMA_API_KEY", raising=False)
+    monkeypatch.delenv("ILMA_RATE_LIMIT_RPS", raising=False)
+    monkeypatch.setenv("ILMA_CORS_ORIGINS", "https://app.example")
+    service = FakeHttpService()
+    app = create_app(cast(Any, service))
+    with TestClient(app) as test_client:
+        status = test_client.get("/status", headers={"Origin": "https://app.example"})
+        assert status.status_code == 200
+        assert status.headers["access-control-allow-origin"] == "https://app.example"
+
+        metrics = test_client.get("/metrics")
+        assert metrics.status_code == 200
+        body = metrics.text
+        assert "request_count" in body
+        assert "request_duration" in body
+        assert "tool_call_count" in body
+        assert "tool_call_duration" in body
+        assert "memory_search_latency" in body
+        assert "db_connection_pool_size" in body
+
+    assert any(record["source"] == "http.access" for record in service.access_logs)
+    assert service.access_logs[-1]["context"]["client_ip"]
+    set_service(None)

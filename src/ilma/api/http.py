@@ -7,14 +7,24 @@ this module.  No Hermes-specific imports belong here.
 
 from __future__ import annotations
 
+import os
+import time
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ilma.api.hardening import (
+    METRICS,
+    SlidingWindowRateLimiter,
+    log_observation,
+    pool_size_from_backend,
+)
 from ilma.api.mcp import IlmaMcpService, get_service, set_service
 
 try:  # pragma: no cover - exercised only when optional HTTP dependencies are absent.
-    from fastapi import Depends, FastAPI, Query
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse, PlainTextResponse
 except ImportError as exc:  # pragma: no cover
     raise RuntimeError(
         "FastAPI is required for the HTTP API. Install ilma with the 'http' extra "
@@ -138,6 +148,115 @@ def service_dependency() -> IlmaMcpService:
 
 SERVICE_DEPENDENCY = Depends(service_dependency)
 
+AUTH_EXEMPT_PATHS = {"/health", "/openapi.json"}
+RATE_LIMIT_EXEMPT_PATHS = {"/health"}
+
+
+def _api_key_from_env() -> str | None:
+    value = os.environ.get("ILMA_API_KEY", "").strip()
+    return value or None
+
+
+def _is_api_key_authorized(request: Request) -> bool:
+    configured_api_key = _api_key_from_env()
+    if not configured_api_key or request.url.path in AUTH_EXEMPT_PATHS:
+        return True
+    return request.headers.get("x-api-key", "") == configured_api_key
+
+
+def api_key_dependency(request: Request) -> None:
+    """FastAPI dependency enforcing ILMA_API_KEY via the X-API-Key header."""
+
+    if not _is_api_key_authorized(request):
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+
+
+def _rate_limit_from_env() -> float:
+    value = os.environ.get("ILMA_RATE_LIMIT_RPS", "30").strip()
+    try:
+        parsed = float(value)
+    except ValueError:
+        return 30.0
+    return parsed if parsed >= 0 else 30.0
+
+
+def _cors_origins_from_env() -> list[str]:
+    value = os.environ.get("ILMA_CORS_ORIGINS", "*").strip()
+    if not value:
+        return ["*"]
+    origins = [origin.strip() for origin in value.split(",") if origin.strip()]
+    return origins or ["*"]
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    if request.client is not None:
+        return request.client.host
+    return "unknown"
+
+
+def _route_path(request: Request) -> str:
+    route = request.scope.get("route")
+    path = getattr(route, "path", None)
+    return str(path or request.url.path)
+
+
+def _log_http_access(
+    *,
+    method: str,
+    path: str,
+    status_code: int,
+    duration_seconds: float,
+    client_ip: str,
+) -> None:
+    try:
+        service = get_service()
+    except Exception:
+        return
+    observability = getattr(service, "observability", None)
+    log_observation(
+        observability,
+        level="info" if status_code < 500 else "error",
+        message="http request",
+        source="http.access",
+        context={
+            "method": method,
+            "path": path,
+            "status": status_code,
+            "duration_ms": round(duration_seconds * 1000, 3),
+            "client_ip": client_ip,
+        },
+    )
+
+
+def _refresh_runtime_gauges(service: IlmaMcpService) -> None:
+    METRICS.set_gauge(
+        "db_connection_pool_size", pool_size_from_backend(getattr(service, "backend", None))
+    )
+
+
+def _health_payload(service: IlmaMcpService) -> dict[str, Any]:
+    health = getattr(service, "ilma_health", None)
+    if callable(health):
+        payload = health()
+        if isinstance(payload, dict):
+            return payload
+        return {
+            "ok": False,
+            "error": {
+                "type": "InvalidHealthPayload",
+                "message": "health payload must be an object",
+            },
+        }
+    status = service.ilma_status()
+    backend = status.get("backend", {}) if status.get("ok") else {}
+    return {
+        "ok": bool(status.get("ok") and backend.get("ok", True)),
+        "backend": backend,
+    }
+
 
 def create_app(service: IlmaMcpService | None = None) -> FastAPI:
     """Create the FastAPI app for the ilma REST API.
@@ -157,16 +276,75 @@ def create_app(service: IlmaMcpService | None = None) -> FastAPI:
         version="0.1.0",
     )
 
+    cors_origins = _cors_origins_from_env()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=cors_origins != ["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    rate_limiter = SlidingWindowRateLimiter(requests_per_second=_rate_limit_from_env())
+
+    @app.middleware("http")
+    async def hardening_middleware(request: Request, call_next: Any) -> Response:
+        started = time.perf_counter()
+        client_ip = _client_ip(request)
+        status_code = 500
+        response: Response
+        try:
+            if request.url.path not in RATE_LIMIT_EXEMPT_PATHS and not rate_limiter.allow(
+                client_ip
+            ):
+                response = JSONResponse(
+                    status_code=429,
+                    content={
+                        "ok": False,
+                        "error": {"type": "RateLimitExceeded", "message": "rate limit exceeded"},
+                    },
+                )
+            else:
+                if not _is_api_key_authorized(request):
+                    response = JSONResponse(
+                        status_code=401,
+                        content={
+                            "ok": False,
+                            "error": {
+                                "type": "Unauthorized",
+                                "message": "invalid or missing API key",
+                            },
+                        },
+                    )
+                else:
+                    response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            duration_seconds = time.perf_counter() - started
+            path = _route_path(request)
+            labels = {"method": request.method, "path": path, "status": str(status_code)}
+            METRICS.increment("request_count", labels)
+            METRICS.observe("request_duration", duration_seconds, labels)
+            _log_http_access(
+                method=request.method,
+                path=path,
+                status_code=status_code,
+                duration_seconds=duration_seconds,
+                client_ip=client_ip,
+            )
+
     @app.get("/health", tags=["system"])
     def health(service: IlmaMcpService = SERVICE_DEPENDENCY) -> dict[str, Any]:
-        """Return a lightweight health response for load balancers."""
+        """Return structured health checks for Postgres, pgvector, and embedders."""
 
-        status = service.ilma_status()
-        backend = status.get("backend", {}) if status.get("ok") else {}
-        return {
-            "ok": bool(status.get("ok") and backend.get("ok", True)),
-            "backend": backend,
-        }
+        return _health_payload(service)
+
+    @app.get("/metrics", tags=["system"], response_class=PlainTextResponse)
+    def scrape_metrics(service: IlmaMcpService = SERVICE_DEPENDENCY) -> str:
+        """Return Prometheus-style in-memory runtime metrics."""
+
+        _refresh_runtime_gauges(service)
+        return METRICS.render_prometheus()
 
     @app.get("/status", tags=["system"])
     def status(service: IlmaMcpService = SERVICE_DEPENDENCY) -> dict[str, Any]:
@@ -405,4 +583,11 @@ def app_factory() -> FastAPI:
 app = create_app()
 
 
-__all__ = ["SURFACES", "app", "app_factory", "create_app", "service_dependency"]
+__all__ = [
+    "SURFACES",
+    "api_key_dependency",
+    "app",
+    "app_factory",
+    "create_app",
+    "service_dependency",
+]

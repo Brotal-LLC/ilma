@@ -161,12 +161,14 @@ class FakeMetricsRepo:
 class FakeObservabilityRepo:
     def __init__(self) -> None:
         self.initialized = False
+        self.logged: list[dict[str, Any]] = []
 
     def initialize_schema(self) -> None:
         self.initialized = True
 
     def log(self, level: str, message: str, **kwargs: Any) -> int:
-        return 11
+        self.logged.append({"level": level, "message": message, **kwargs})
+        return len(self.logged)
 
     def query(self, **kwargs: Any) -> list[dict[str, Any]]:
         return [{"id": 11, "level": kwargs.get("level") or "info"}]
@@ -350,6 +352,16 @@ def test_errors_are_structured_and_failed_writes_are_audited(service: IlmaMcpSer
     assert audit_logger.records[-1]["tool_name"] == "ilma_remember"
     assert audit_logger.records[-1]["status"] == "failed"
     assert audit_logger.records[-1]["error_type"] == "ValueError"
+
+
+def test_tool_calls_are_structured_logged(service: IlmaMcpService) -> None:
+    result = service.ilma_search("dark")
+    assert result["ok"] is True
+    assert service.backend.observability.logged
+    record = service.backend.observability.logged[-1]
+    assert record["source"] == "mcp.tool"
+    assert record["context"]["tool_name"] == "ilma_search"
+    assert record["context"]["success"] is True
 
 
 def test_maintenance_initializes_all_surfaces(service: IlmaMcpService) -> None:

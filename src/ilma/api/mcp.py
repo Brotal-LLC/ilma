@@ -9,16 +9,18 @@ not crash the server on expected repository errors.
 from __future__ import annotations
 
 import os
+import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from ilma.api.hardening import METRICS, log_observation
 from ilma.storage.postgres import PgBackend
 
 try:  # Imported at module load so the entry point fails clearly if MCP is absent.
@@ -267,22 +269,65 @@ class IlmaMcpService:
     def call(
         self, tool_name: str, fn: Callable[[], dict[str, Any]], payload: dict[str, Any]
     ) -> dict[str, Any]:
+        started = time.perf_counter()
         operation_id: str | None = None
-        if tool_name in WRITE_TOOLS:
-            surface, action = WRITE_TOOLS[tool_name]
-            try:
-                operation_id = self.audit.begin(tool_name, surface, action, payload)
-            except Exception as exc:  # audit is write-ahead: do not execute write if it fails.
-                return _err(exc)
+        success = False
+        error: BaseException | None = None
         try:
-            result = fn()
-        except Exception as exc:  # Never crash MCP server for repository/tool errors.
+            if tool_name in WRITE_TOOLS:
+                surface, action = WRITE_TOOLS[tool_name]
+                try:
+                    operation_id = self.audit.begin(tool_name, surface, action, payload)
+                except Exception as exc:  # audit is write-ahead: do not execute write if it fails.
+                    error = exc
+                    return _err(exc)
+            try:
+                result = fn()
+            except Exception as exc:  # Never crash MCP server for repository/tool errors.
+                error = exc
+                if operation_id is not None:
+                    self._safe_audit_finish(operation_id, status="failed", error=exc)
+                return _err(exc)
             if operation_id is not None:
-                self._safe_audit_finish(operation_id, status="failed", error=exc)
-            return _err(exc)
-        if operation_id is not None:
-            self._safe_audit_finish(operation_id, status="succeeded", result=result)
-        return _json_safe(result)
+                self._safe_audit_finish(operation_id, status="succeeded", result=result)
+            success = True
+            return cast(dict[str, Any], _json_safe(result))
+        finally:
+            self._record_tool_call(
+                tool_name,
+                duration_seconds=time.perf_counter() - started,
+                success=success,
+                error=error,
+            )
+
+    def _record_tool_call(
+        self,
+        tool_name: str,
+        *,
+        duration_seconds: float,
+        success: bool,
+        error: BaseException | None = None,
+    ) -> None:
+        labels = {"tool_name": tool_name, "success": str(success).lower()}
+        METRICS.increment("tool_call_count", labels)
+        METRICS.observe("tool_call_duration", duration_seconds, labels)
+        if tool_name == "ilma_search":
+            METRICS.observe(
+                "memory_search_latency", duration_seconds, {"success": str(success).lower()}
+            )
+        log_observation(
+            self.observability,
+            level="info" if success else "error",
+            message="mcp tool call",
+            source="mcp.tool",
+            context={
+                "tool_name": tool_name,
+                "duration_ms": round(duration_seconds * 1000, 3),
+                "success": success,
+                "error_type": type(error).__name__ if error else None,
+                "error_message": str(error) if error else None,
+            },
+        )
 
     def _safe_audit_finish(
         self,
@@ -296,6 +341,64 @@ class IlmaMcpService:
             self.audit.finish(operation_id, status=status, result=result, error=error)
         except Exception:
             traceback.print_exc()
+
+    def ilma_health(self) -> dict[str, Any]:
+        """Run structured HTTP health checks without registering another MCP tool."""
+
+        checks: dict[str, Any] = {}
+        backend_health: dict[str, Any]
+        try:
+            backend_health = self.backend.health()
+            checks["postgres"] = {
+                "ok": bool(backend_health.get("ok", False)),
+                "database": backend_health.get("database"),
+            }
+            checks["pgvector"] = {"ok": bool(backend_health.get("pgvector", False))}
+        except Exception as exc:
+            backend_health = {
+                "ok": False,
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+            }
+            checks["postgres"] = backend_health
+            checks["pgvector"] = {"ok": False, "skipped": "postgres check failed"}
+
+        checks["embedder"] = self._check_embedder()
+        ok = all(bool(check.get("ok", False)) for check in checks.values())
+        return _ok(
+            ok=ok, status="healthy" if ok else "unhealthy", backend=backend_health, checks=checks
+        )
+
+    def _check_embedder(self) -> dict[str, Any]:
+        embedder_registry = getattr(self.memory, "_embedders", None)
+        if embedder_registry is None:
+            embedder_registry = getattr(self.wiki, "_embedders", None)
+        if embedder_registry is None:
+            return {
+                "ok": True,
+                "configured": False,
+                "skipped": "embedder unavailable on repository",
+            }
+        dim = int(
+            getattr(embedder_registry, "default_dim", getattr(self.memory, "default_dim", 0) or 0)
+        )
+        try:
+            embed = embedder_registry.embed
+            if dim > 0:
+                vector = embed("ilma health embedder reachability check", dim=dim)
+            else:
+                vector = embed("ilma health embedder reachability check")
+            return {
+                "ok": True,
+                "configured": True,
+                "default_dim": dim,
+                "vector_length": len(vector),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "configured": True,
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+            }
 
     # Memory surface -----------------------------------------------------
     def ilma_status(self) -> dict[str, Any]:
