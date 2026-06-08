@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Protocol
 
 
 @dataclass
@@ -18,7 +18,9 @@ class Skill:
 
 
 class SkillsRepo(Protocol):
-    def upsert(self, name: str, content: str, *, category: str | None = None, tags: list[str] | None = None) -> int:
+    def upsert(
+        self, name: str, content: str, *, category: str | None = None, tags: list[str] | None = None
+    ) -> int:
         """Store or update a skill. Returns skill id."""
         ...
 

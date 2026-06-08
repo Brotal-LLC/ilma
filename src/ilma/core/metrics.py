@@ -21,7 +21,14 @@ class MetricsRepo(Protocol):
         """Record a metric point. Returns point id."""
         ...
 
-    def query(self, name: str, *, start: datetime | None = None, end: datetime | None = None, limit: int = 100) -> list[Metric]:
+    def query(
+        self,
+        name: str,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Metric]:
         """Query metric history."""
         ...
 

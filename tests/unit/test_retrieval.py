@@ -39,7 +39,9 @@ class FakeMemoryRepo(MemoryRepo):
         )
         return mid
 
-    def search(self, query: str, *, top_k: int = 10, hybrid_text_weight: float = 0.5) -> list[Memory]:
+    def search(
+        self, query: str, *, top_k: int = 10, hybrid_text_weight: float = 0.5
+    ) -> list[Memory]:
         # Match if ANY word in the query appears in content, tags, or category
         words = [w for w in query.lower().split() if len(w) > 2]
         if not words:
@@ -68,6 +70,7 @@ class FakeMemoryRepo(MemoryRepo):
 # Query sanitizer
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
@@ -85,6 +88,7 @@ def test_sanitize_query(raw: str, expected: str) -> None:
 # ---------------------------------------------------------------------------
 # Memory scoring
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     ("tags", "category", "expected_min"),
@@ -104,6 +108,7 @@ def test_score_memory(tags: tuple[str, ...], category: str | None, expected_min:
 # Bullet formatting
 # ---------------------------------------------------------------------------
 
+
 def test_format_bullet_short() -> None:
     m = Memory(id=1, content="short", tags=("a", "b"))
     assert _format_bullet(m) == "• [a b] short"
@@ -119,6 +124,7 @@ def test_format_bullet_long_truncation() -> None:
 # ---------------------------------------------------------------------------
 # InjectionLayer.render
 # ---------------------------------------------------------------------------
+
 
 def test_render_empty_repo() -> None:
     repo = FakeMemoryRepo()
@@ -167,6 +173,7 @@ def test_render_no_repo() -> None:
 # ---------------------------------------------------------------------------
 # build_memory_block wrapper
 # ---------------------------------------------------------------------------
+
 
 def test_build_memory_block_signature() -> None:
     repo = FakeMemoryRepo()

@@ -8,7 +8,6 @@ and query sanitization.
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from ilma.core.memory import Memory, MemoryRepo
 

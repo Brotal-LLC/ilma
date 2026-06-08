@@ -18,10 +18,25 @@ class Observation:
 
 
 class ObservabilityRepo(Protocol):
-    def log(self, level: str, message: str, *, source: str | None = None, context: dict[str, Any] | None = None) -> int:
+    def log(
+        self,
+        level: str,
+        message: str,
+        *,
+        source: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> int:
         """Log an observation. Returns observation id."""
         ...
 
-    def query(self, *, level: str | None = None, source: str | None = None, start: datetime | None = None, end: datetime | None = None, limit: int = 100) -> list[Observation]:
+    def query(
+        self,
+        *,
+        level: str | None = None,
+        source: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Observation]:
         """Query observations."""
         ...

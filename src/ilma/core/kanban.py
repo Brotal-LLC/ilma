@@ -22,7 +22,16 @@ class Task:
 
 
 class KanbanRepo(Protocol):
-    def create(self, title: str, *, description: str = "", status: str = "todo", priority: int = 0, tags: list[str] | None = None, parent_id: int | None = None) -> int:
+    def create(
+        self,
+        title: str,
+        *,
+        description: str = "",
+        status: str = "todo",
+        priority: int = 0,
+        tags: list[str] | None = None,
+        parent_id: int | None = None,
+    ) -> int:
         """Create a task. Returns task id."""
         ...
 
