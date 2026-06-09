@@ -1,2 +1,15 @@
-# ilma's actionlint config. Currently empty — add suppressions here as
-# needed, each with a one-line rationale comment.
+# ilma's actionlint config.
+#
+# The 'rogue' label pins to a specific self-hosted runner host. The sv
+# workflow uses the same label scheme (see skb50bd/sv/.github/actionlint.yaml)
+# because the Brotal-LLC self-hosted runner is org-scoped and shared
+# between sv and ilma.
+#
+# Add suppressions here only for known false-positives, each with a
+# one-line rationale comment. Do not blanket-disable lints.
+self-hosted-runner:
+  labels:
+    - self-hosted
+    - linux
+    - x64
+    - rogue
