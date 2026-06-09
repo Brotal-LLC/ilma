@@ -429,7 +429,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ilma"
+name = "ilma-agent"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
