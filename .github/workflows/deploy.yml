@@ -1,0 +1,136 @@
+name: Deploy
+
+"on":
+  workflow_run:
+    workflows: [Publish]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Deploy the current image or roll back to the previously deployed image"
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - rollback
+      image_tag:
+        description: "GHCR image tag to deploy"
+        required: true
+        default: main
+        type: string
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false # never cancel a deploy — let it finish or fail
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'deploy')
+    environment:
+      name: production
+      url: https://ilma.aamar.cloud/health
+    env:
+      IMAGE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || 'main' }}
+      GHCR_USERNAME: ${{ github.actor }}
+      GHCR_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Deploy via SSH
+        id: deploy
+        uses: appleboy/ssh-action@v1
+        with:
+          # GitHub-hosted runners cannot reach the user's infra via localhost;
+          # the SSH target is the same host, addressed externally.
+          host: ilma.aamar.cloud
+          username: shakib
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: IMAGE_TAG,GHCR_USERNAME,GHCR_TOKEN
+          script: |
+            /home/shakib/infra/scripts/deploy-ilma.sh deploy
+
+      - name: Smoke test
+        run: |
+          sleep 5 # give the container and caddy-docker-proxy a moment to converge
+          for i in {1..12}; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' https://ilma.aamar.cloud/health)
+            if [ "$code" = "200" ]; then
+              echo "Smoke test PASSED on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $code, retrying..."
+            sleep 5
+          done
+          echo "Smoke test FAILED — ilma did not become healthy"
+          exit 1
+
+      - name: Roll back failed deploy
+        if: failure() && steps.deploy.outcome == 'success'
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ilma.aamar.cloud
+          username: shakib
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: GHCR_USERNAME,GHCR_TOKEN
+          script: |
+            /home/shakib/infra/scripts/deploy-ilma.sh rollback
+
+      - name: Smoke test rollback
+        if: failure() && steps.deploy.outcome == 'success'
+        run: |
+          sleep 5
+          for i in {1..12}; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' https://ilma.aamar.cloud/health)
+            if [ "$code" = "200" ]; then
+              echo "Rollback smoke test PASSED on attempt $i"
+              exit 0
+            fi
+            echo "Rollback attempt $i: HTTP $code, retrying..."
+            sleep 5
+          done
+          echo "Rollback smoke test FAILED"
+          exit 1
+
+  rollback:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'rollback'
+    environment:
+      name: production
+      url: https://ilma.aamar.cloud/health
+
+    steps:
+      - name: Roll back via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ilma.aamar.cloud
+          username: shakib
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: GHCR_USERNAME,GHCR_TOKEN
+          script: |
+            /home/shakib/infra/scripts/deploy-ilma.sh rollback
+
+      - name: Smoke test rollback
+        run: |
+          sleep 5
+          for i in {1..12}; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' https://ilma.aamar.cloud/health)
+            if [ "$code" = "200" ]; then
+              echo "Rollback smoke test PASSED on attempt $i"
+              exit 0
+            fi
+            echo "Rollback attempt $i: HTTP $code, retrying..."
+            sleep 5
+          done
+          echo "Rollback smoke test FAILED"
+          exit 1
