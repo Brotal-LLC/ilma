@@ -74,8 +74,7 @@ def test_yaml_overlay(tmp_path: Path) -> None:
 def test_env_overrides_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     yaml_path = tmp_path / "ilma.yaml"
     yaml_path.write_text(
-        "postgres:\n  dsn: postgres://yaml.example/db\n"
-        "memory:\n  namespace: from-yaml\n",
+        "postgres:\n  dsn: postgres://yaml.example/db\nmemory:\n  namespace: from-yaml\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("ILMA_PG_DSN", "postgres://env.example/db")
@@ -102,6 +101,7 @@ def test_nested_lookup() -> None:
 
 def test_source_of_default(monkeypatch) -> None:
     import os
+
     print("DEBUG: env HERMES_PG_CONN_STR:", os.environ.get("HERMES_PG_CONN_STR"))
     config = IlmaConfig.from_env()
     print("DEBUG: config.postgres.dsn:", repr(config.postgres.dsn))

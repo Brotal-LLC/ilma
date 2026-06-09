@@ -39,8 +39,8 @@ def build_memory_block(repo, *, char_limit=2200):
 4. Integration test against real `PgMemoryRepo`
 5. PR to `skb50bd/hermes-memory` (last PR before extraction)
 
-**ETA:** 1-2 days  
-**Owner:** 1 dev  
+**ETA:** 1-2 days
+**Owner:** 1 dev
 **Deliverable:** PR #11 on hermes-memory
 
 ---
@@ -114,7 +114,7 @@ ilma/
 | S8 | CLI | `ilma init`, `status`, `search`, `remember`, `doctor`, `migrate`, `repair` | S1-S5 |
 | S9 | Hermes adapter | `register(ctx)`, `build_memory_block` via `InjectionLayer` | S6 |
 
-**ETA:** 1.5-2 weeks (parallel team)  
+**ETA:** 1.5-2 weeks (parallel team)
 **Deliverable:** `ilma` v0.1.0 on PyPI
 
 ---
@@ -160,7 +160,7 @@ GET  /wiki/search
 4. Rate limiting per scope
 5. HTTP auth (API key, mTLS behind Caddy)
 
-**ETA:** 3-4 days (after P1)  
+**ETA:** 3-4 days (after P1)
 **Deliverable:** `ilma mcp` and `ilma serve` commands
 
 ---
@@ -179,7 +179,7 @@ GET  /wiki/search
 3. Config resolution: env → `config.yaml` → default
 4. Backward compat: `memory.provider: postgres` still works
 
-**ETA:** 2-3 days  
+**ETA:** 2-3 days
 **Deliverable:** Hermes plugin in `ilma/src/adapters/hermes/`
 
 ---
@@ -246,7 +246,7 @@ memory.ilma.bd {
 5. Verify non-root containers
 6. Domain cert via Caddy
 
-**ETA:** 2-3 days  
+**ETA:** 2-3 days
 **Deliverable:** `docker compose up` in `~/infra/ilma/`
 
 ---
@@ -264,7 +264,7 @@ memory.ilma.bd {
 | Knowledge graph v2 | Medium | Temporal triples on top of wiki links |
 | Memory layers (L0-L3) | Low | Working vs. long-term memory abstraction |
 
-**ETA:** Ongoing, 1-2 days per feature  
+**ETA:** Ongoing, 1-2 days per feature
 **Deliverable:** Incremental PRs
 
 ---
@@ -286,7 +286,7 @@ memory.ilma.bd {
 3. Rollback script
 4. `MIGRATION.md` documentation
 
-**ETA:** 2-3 days  
+**ETA:** 2-3 days
 **Deliverable:** `ilma migrate --from hermes-memory --dry-run`
 
 ---
@@ -312,7 +312,7 @@ memory.ilma.bd {
 - PyYAML in lint deps
 - 5s stabilization sleep after init
 
-**ETA:** 2 days  
+**ETA:** 2 days
 **Deliverable:** Green CI
 
 ---

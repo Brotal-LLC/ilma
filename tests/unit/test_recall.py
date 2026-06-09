@@ -84,7 +84,9 @@ class _FakeService:
         return fn()
 
     @staticmethod
-    def _filter_by_threshold(rows: list[_FakeMemoryResult], threshold: float) -> list[_FakeMemoryResult]:
+    def _filter_by_threshold(
+        rows: list[_FakeMemoryResult], threshold: float
+    ) -> list[_FakeMemoryResult]:
         return IlmaService._filter_by_threshold(rows, threshold)
 
 

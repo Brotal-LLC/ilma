@@ -64,6 +64,22 @@ Postgres + pgvector
 
 In active development. See [PLAN.md](PLAN.md) for the execution roadmap.
 
+## Development
+
+Install dev dependencies and set up pre-commit:
+
+```bash
+make install
+pip install pre-commit
+pre-commit install
+```
+
+Run all checks locally:
+
+```bash
+make all
+```
+
 ## License
 
 MIT

@@ -282,6 +282,7 @@ async def test_mcp_server_registration_is_driven_by_tools_dict_loop(
     assert "hybrid_text_weight" in tools["ilma_recall"].inputSchema["properties"]
 
     import json
+
     result = await server.call_tool("ilma_recall", {"query": "dark"})
     # FastMCP >=1.0 returns a list of TextContent blocks; the JSON
     # payload is in result[0].text. Cast to TextContent for type-checkers.
@@ -289,11 +290,14 @@ async def test_mcp_server_registration_is_driven_by_tools_dict_loop(
     assert isinstance(structured, dict)
     assert structured["ok"] is True
     assert structured["results"][0]["content"] == "User prefers dark mode"
+
+
 @pytest.mark.asyncio
 async def test_mcp_server_write_tool_audits_once(service: IlmaMcpService) -> None:
     server = create_mcp_server(service)
 
     import json
+
     result = await server.call_tool("ilma_remember", {"content": "from mcp"})
     structured = json.loads(cast(TextContent, result[0]).text)
 

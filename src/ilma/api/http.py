@@ -129,7 +129,9 @@ def _rate_limit_from_env() -> float:
 
 
 def _cors_origins_from_env() -> list[str]:
-    origins = [origin.strip() for origin in IlmaConfig.from_env().api.cors_origins if origin.strip()]
+    origins = [
+        origin.strip() for origin in IlmaConfig.from_env().api.cors_origins if origin.strip()
+    ]
     return origins or ["*"]
 
 

@@ -364,7 +364,13 @@ def recall(
     limit: Annotated[int, typer.Option("--limit", "-n", min=1, max=100)] = 10,
     threshold: Annotated[
         float,
-        typer.Option("--threshold", "-t", min=0.0, max=1.0, help="Minimum similarity score (0.0 = no filter)."),
+        typer.Option(
+            "--threshold",
+            "-t",
+            min=0.0,
+            max=1.0,
+            help="Minimum similarity score (0.0 = no filter).",
+        ),
     ] = 0.0,
     hybrid_text_weight: Annotated[
         float,
@@ -383,7 +389,9 @@ def recall(
         return
     results = _json_safe(result.get("results", []))
     count = result.get("count", len(results))
-    typer.echo(f"Recall: {count} result(s) for query={query!r} (limit={result.get('limit', limit)})")
+    typer.echo(
+        f"Recall: {count} result(s) for query={query!r} (limit={result.get('limit', limit)})"
+    )
     if not results:
         typer.echo("No memories found.")
         return

@@ -94,6 +94,7 @@ def _make_tool_handler(
     calls ``self.call(...)``). Wrapping here would double-fire the
     audit log.
     """
+
     def handler(**kwargs: Any) -> dict[str, Any]:
         try:
             model_instance = model(**kwargs)
@@ -135,7 +136,9 @@ def _parse_google_args(doc: str) -> dict[str, str]:
             continue
         if stripped and not line.startswith((" ", "\t")):
             break
-        match = re.match(r"^(?P<indent>\s+)(?P<name>[A-Za-z_]\w*)(?:\s*\([^)]*\))?:\s*(?P<desc>.*)$", line)
+        match = re.match(
+            r"^(?P<indent>\s+)(?P<name>[A-Za-z_]\w*)(?:\s*\([^)]*\))?:\s*(?P<desc>.*)$", line
+        )
         if match:
             current_name = match.group("name")
             current_indent = len(match.group("indent"))
@@ -1350,9 +1353,7 @@ class IlmaService:
 
     # SQL fallback helpers for list/get tools not present in core Protocols.
     @staticmethod
-    def _filter_by_threshold(
-        results: list[Any], threshold: float
-    ) -> list[Any]:
+    def _filter_by_threshold(results: list[Any], threshold: float) -> list[Any]:
         """Filter search results by minimum similarity score.
 
         The current ``ilma.memory.search`` does not return per-row similarity
@@ -1575,4 +1576,3 @@ def _count_tools(service_cls: type[Any] = IlmaService) -> int:
 
 
 TOOL_COUNT: int = _count_tools()
-

@@ -104,9 +104,7 @@ class IlmaConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     vectors: VectorsConfig = field(default_factory=VectorsConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
-    _sources: Mapping[str, ConfigSource] = field(
-        default_factory=dict, repr=False, compare=False
-    )
+    _sources: Mapping[str, ConfigSource] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         sources = dict(self._sources) if self._sources else _default_sources(type(self))
@@ -409,8 +407,7 @@ def _coerce_tuple(raw_value: Any) -> tuple[str, ...]:
 def _plain_dataclass_dict(value: Any) -> Any:
     if is_dataclass(value):
         return {
-            item.name: _plain_dataclass_dict(getattr(value, item.name))
-            for item in fields(value)
+            item.name: _plain_dataclass_dict(getattr(value, item.name)) for item in fields(value)
         }
     if isinstance(value, tuple):
         return tuple(_plain_dataclass_dict(item) for item in value)

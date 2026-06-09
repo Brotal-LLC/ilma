@@ -32,7 +32,13 @@ class RegistrationService:
         category: str | None = None,
         source: str | None = "mcp",
     ) -> dict[str, Any]:
-        return {"ok": True, "content": content, "tags": tags, "category": category, "source": source}
+        return {
+            "ok": True,
+            "content": content,
+            "tags": tags,
+            "category": category,
+            "source": source,
+        }
 
     def ilma_forget(self, memory_id: int) -> dict[str, Any]:
         return {"ok": True, "memory_id": memory_id}
@@ -63,7 +69,9 @@ def test_tools_dict_cli_equivalents_are_registered() -> None:
         command_name = cli._CLI_TOOL_TO_COMMAND.get(tool_name)
         if command_name is None:
             continue
-        assert command_name in registered_names, f"{tool_name} is missing CLI command {command_name}"
+        assert command_name in registered_names, (
+            f"{tool_name} is missing CLI command {command_name}"
+        )
 
 
 def test_cli_excluded_contains_only_four_hand_written_commands() -> None:

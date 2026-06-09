@@ -35,6 +35,7 @@ except ImportError as exc:  # pragma: no cover - exercised by packaging/import e
         "or install the 'mcp' package."
     ) from exc
 
+
 class PgAuditLogger:
     """Write-ahead audit logger stored in Postgres.
 
@@ -252,7 +253,9 @@ def create_mcp_server(service: IlmaMcpService | None = None) -> FastMCP:
 # Names that the typing module does NOT export as attributes (they're
 # builtins). Pre-populating these into the exec namespace with ``None``
 # would shadow the real types and break annotation evaluation.
-_BUILTIN_NAMES = frozenset({"str", "int", "float", "bool", "bytes", "list", "dict", "set", "tuple", "frozenset", "type"})
+_BUILTIN_NAMES = frozenset(
+    {"str", "int", "float", "bool", "bytes", "list", "dict", "set", "tuple", "frozenset", "type"}
+)
 
 
 def _collect_typing_names(ann_str: str) -> set[str]:
@@ -264,11 +267,36 @@ def _collect_typing_names(ann_str: str) -> set[str]:
     in its namespace to evaluate annotations with ``eval_str=True``.
     """
     candidates = {
-        "Any", "Optional", "Union", "List", "Dict", "Tuple", "Set", "FrozenSet",
-        "Sequence", "Mapping", "Iterable", "Iterator", "Callable", "Type",
-        "ClassVar", "Literal", "Final", "Annotated", "TypeVar", "Generic",
-        "list", "dict", "set", "tuple", "frozenset", "int", "float", "bool",
-        "str", "bytes",
+        "Any",
+        "Optional",
+        "Union",
+        "List",
+        "Dict",
+        "Tuple",
+        "Set",
+        "FrozenSet",
+        "Sequence",
+        "Mapping",
+        "Iterable",
+        "Iterator",
+        "Callable",
+        "Type",
+        "ClassVar",
+        "Literal",
+        "Final",
+        "Annotated",
+        "TypeVar",
+        "Generic",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "frozenset",
+        "int",
+        "float",
+        "bool",
+        "str",
+        "bytes",
         # Note: "None" is intentionally excluded — it's a built-in literal,
         # not a typing object, and pre-populating it would shadow the
         # built-in and break annotation evaluation (Optional[None]).
@@ -277,6 +305,7 @@ def _collect_typing_names(ann_str: str) -> set[str]:
     for name in candidates:
         # Word-boundary match so 'str' doesn't match inside 'strong'.
         import re
+
         if re.search(rf"\b{re.escape(name)}\b", ann_str):
             found.add(name)
     return found
@@ -285,6 +314,7 @@ def _collect_typing_names(ann_str: str) -> set[str]:
 def _lookup_typing_name(name: str) -> Any:
     """Resolve a typing name to the actual object for the exec namespace."""
     import typing
+
     return getattr(typing, name, None)
 
 
