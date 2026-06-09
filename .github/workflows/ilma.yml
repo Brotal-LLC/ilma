@@ -251,20 +251,51 @@ jobs:
 
 # ==============================================================================
 # PHASE 6 — Release (push `v*` tag only, gated on build)
-# Auto-generates GitHub release notes from merged PRs. Does NOT publish to
-# PyPI (no PYPI_API_TOKEN secret configured) and does NOT deploy to
-# ilma.aamar.cloud (user OOB: CI must not mutate local environment).
+# Auto-generates GitHub release notes from merged PRs and publishes the
+# package to PyPI via Trusted Publishing (OIDC, no long-lived secret).
+#
+# PyPI Trusted Publishing setup (one-time, by hand):
+#   1. https://pypi.org/manage/account/publishing/ → "Add pending publisher"
+#   2. PyPI Project Name: ilma
+#      Owner:               Brotal-LLC
+#      Repository name:     ilma
+#      Workflow filename:   ilma.yml
+#      Environment name:    production
+#   3. First v* push will create the project on PyPI via this workflow.
+#
+# Does NOT deploy to ilma.aamar.cloud (user OOB: CI must not mutate
+# local environment).
 # ==============================================================================
   release:
     needs: [build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: [self-hosted, linux, x64, rogue]
     permissions:
+      # contents: write — gh release create
+      # id-token: write — PyPI Trusted Publishing OIDC handshake
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+
+      - name: Build sdist + wheel
+        run: python -m build --sdist --wheel
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
