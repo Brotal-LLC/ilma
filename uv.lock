@@ -467,6 +467,17 @@ openai = [
     { name = "openai" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "fastapi" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+    { name = "testcontainers" },
+    { name = "uvicorn" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'http'", specifier = ">=0.110" },
@@ -491,6 +502,17 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'http'", specifier = ">=0.29" },
 ]
 provides-extras = ["http", "mcp", "ollama", "openai", "dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "fastapi", specifier = ">=0.110" },
+    { name = "mypy", specifier = ">=1.9" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "ruff", specifier = ">=0.6" },
+    { name = "testcontainers", specifier = ">=4.0" },
+    { name = "uvicorn", specifier = ">=0.29" },
+]
 
 [[package]]
 name = "iniconfig"

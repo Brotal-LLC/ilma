@@ -49,6 +49,17 @@ dev = [
     "testcontainers>=4.0",
 ]
 
+[dependency-groups]
+dev = [
+    "fastapi>=0.110",
+    "mypy>=1.9",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "testcontainers>=4.0",
+    "uvicorn>=0.29",
+]
+
 [project.scripts]
 ilma = "ilma.api.cli:main"
 ilma-mcp = "ilma.api.mcp:main"
@@ -63,9 +74,6 @@ memory = "ilma.storage.memory:InMemoryBackend"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ilma"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/ilma/plugins/memory/ilma" = "ilma/plugins/memory/ilma"
 
 [tool.ruff]
 target-version = "py311"
