@@ -256,12 +256,20 @@ jobs:
 #
 # PyPI Trusted Publishing setup (one-time, by hand):
 #   1. https://pypi.org/manage/account/publishing/ → "Add pending publisher"
-#   2. PyPI Project Name: ilma
+#   2. PyPI Project Name: ilma-agent
 #      Owner:               Brotal-LLC
 #      Repository name:     ilma
 #      Workflow filename:   ilma.yml
 #      Environment name:    production
 #   3. First v* push will create the project on PyPI via this workflow.
+#
+# The "ilma" GitHub repo name, the `import ilma` Python path, the
+# `ilma` and `ilma-mcp` console scripts, and the `ghcr.io/brotal-llc/ilma`
+# Docker image are all UNAFFECTED by this distribution name — only
+# `pip install ilma-agent` and `pypi.org/project/ilma-agent` change.
+# The bare name "ilma" on PyPI is blocked by similarity to an existing
+# "ilmarine" project (Feb 2022, internal-pypi upload squat), so we
+# publish under the hyphenated "ilma-agent" distribution name.
 #
 # Does NOT deploy to ilma.aamar.cloud (user OOB: CI must not mutate
 # local environment).
