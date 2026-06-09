@@ -1,0 +1,16 @@
+# ilma's hadolint config.
+#
+# DL3013 (pin pip versions) is suppressed because:
+#   - Line 11 (`pip install --upgrade pip wheel`) installs pip's own
+#     build dependencies, not the project. These are bound to the
+#     python:3.11-slim base image's vendored versions and pinning to
+#     arbitrary versions creates break-the-image-on-rebuild risk.
+#   - Line 19 (`pip wheel .[http,mcp]`) installs the ilma project itself
+#     from the local source. Pinning the project to its own version
+#     would create a chicken-and-egg problem during development.
+#   - Line 39 (`pip install --no-index --find-links=/wheels ilma[http,mcp]`)
+#     installs from local wheels only — no network. Pinning is moot.
+# If you change the build process to fetch from PyPI, remove this override
+# and pin to a specific version of ilma.
+ignored:
+  - DL3013

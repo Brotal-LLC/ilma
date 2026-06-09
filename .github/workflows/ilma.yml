@@ -30,6 +30,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "Dockerfile"
+      - ".hadolint.yaml"
       - "docker/**"
       - ".github/workflows/ilma.yml"
       - ".github/actionlint.yaml"
@@ -41,6 +42,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "Dockerfile"
+      - ".hadolint.yaml"
       - "docker/**"
       - ".github/workflows/ilma.yml"
       - ".github/actionlint.yaml"
@@ -72,7 +74,7 @@ env:
 jobs:
   lint:
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rogue]
     steps:
       - uses: actions/checkout@v6
 
@@ -118,7 +120,7 @@ jobs:
 # ==============================================================================
   test:
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rogue]
     strategy:
       fail-fast: false
       matrix:
@@ -162,7 +164,7 @@ jobs:
 # ==============================================================================
   security:
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rogue]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -170,9 +172,12 @@ jobs:
       - name: TruffleHog secret scan
         uses: trufflesecurity/trufflehog@main
         with:
+          # Scan the entire repo on every event. The action's built-in
+          # `base`/`head` derivation errors on single-commit push events
+          # with "BASE and HEAD commits are the same"; a full scan is
+          # slightly slower but never fails spuriously. Verified-secrets
+          # only — no false-positive noise in the build log.
           path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
           extra_args: --debug --only-verified
 
 # ==============================================================================
@@ -183,7 +188,7 @@ jobs:
   tag:
     needs: [lint, test, security]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rogue]
     outputs:
       build_tag: ${{ steps.sha.outputs.value }}
     steps:
@@ -202,7 +207,7 @@ jobs:
   build:
     needs: [tag]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rogue]
     permissions:
       contents: read
       packages: write
@@ -253,7 +258,7 @@ jobs:
   release:
     needs: [build]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, rogue]
     permissions:
       contents: write
     steps:
