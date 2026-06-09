@@ -7,11 +7,13 @@ this module.  No Hermes-specific imports belong here.
 
 from __future__ import annotations
 
+import inspect
 import os
+import re
 import time
-from typing import Any
+from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ValidationError, create_model
 
 from ilma.api.hardening import (
     METRICS,
@@ -20,9 +22,10 @@ from ilma.api.hardening import (
     pool_size_from_backend,
 )
 from ilma.api.mcp import IlmaMcpService, get_service, set_service
+from ilma.service import tools_dict
 
 try:  # pragma: no cover - exercised only when optional HTTP dependencies are absent.
-    from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+    from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, Response
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse, PlainTextResponse
 except ImportError as exc:  # pragma: no cover
@@ -44,100 +47,49 @@ SURFACES = [
 ]
 
 
-class SearchRequest(BaseModel):
-    query: str
-    top_k: int = Field(default=10, ge=1, le=500)
-    hybrid_text_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+_TOOL_TO_ROUTE: dict[str, tuple[str, str]] = {
+    "ilma_status": ("/status", "GET"),
+    "ilma_search": ("/search", "POST"),
+    "ilma_remember": ("/remember", "POST"),
+    "ilma_forget": ("/forget", "POST"),
+    "ilma_get_memory": ("/memories/{memory_id}", "GET"),
+    "ilma_list_memories": ("/memories", "GET"),
+    "ilma_get_wiki": ("/wiki/{slug}", "GET"),
+    "ilma_search_wiki": ("/wiki/search", "POST"),
+    "ilma_list_wiki": ("/wiki", "GET"),
+    "ilma_wiki_create": ("/wiki", "POST"),
+    "ilma_wiki_update": ("/wiki/{slug}", "PATCH"),
+    "ilma_journal_search": ("/journal/search", "POST"),
+    "ilma_journal_recent": ("/journal/recent", "GET"),
+    "ilma_skills_search": ("/skills/search", "POST"),
+    "ilma_skills_get": ("/skills/{name}", "GET"),
+    "ilma_kanban_list": ("/kanban", "GET"),
+    "ilma_kanban_get": ("/kanban/{task_id}", "GET"),
+    "ilma_kanban_create": ("/kanban", "POST"),
+    "ilma_kanban_update": ("/kanban/{task_id}", "PATCH"),
+    "ilma_kanban_complete": ("/kanban/{task_id}/complete", "POST"),
+    "ilma_metrics_record": ("/metrics", "POST"),
+    "ilma_metrics_query": ("/metrics/query", "POST"),
+    "ilma_obs_log": ("/observations", "POST"),
+    "ilma_obs_query": ("/observations/query", "POST"),
+    "ilma_session_search": ("/sessions/search", "POST"),
+    "ilma_session_get": ("/sessions/{session_id}", "GET"),
+    "ilma_repair": ("/repair", "POST"),
+    "ilma_doctor": ("/doctor", "POST"),
+    # Existing HTTP API route. Not in the original R-008 table, but preserved
+    # here to keep the public HTTP surface and existing tests unchanged.
+    "ilma_migrate": ("/migrate", "POST"),
+}
 
+_HTTP_EXCLUDED = frozenset(
+    {
+        "ilma_status",  # /status is an infrastructure route with custom docs/tagging.
+        "ilma_recent",  # MCP/CLI-only; no existing HTTP route.
+        "ilma_audit",  # CLI-only.
+    }
+)
 
-class RememberRequest(BaseModel):
-    content: str
-    tags: list[str] = Field(default_factory=list)
-    category: str | None = None
-    source: str | None = "http"
-
-
-class ForgetRequest(BaseModel):
-    memory_id: int = Field(ge=1)
-
-
-class WikiSearchRequest(BaseModel):
-    query: str
-    top_k: int = Field(default=5, ge=1, le=500)
-
-
-class WikiWriteRequest(BaseModel):
-    slug: str
-    title: str
-    body_md: str
-    category: str | None = None
-    tags: list[str] = Field(default_factory=list)
-    source_uri: str | None = None
-
-
-class JournalSearchRequest(BaseModel):
-    query: str
-    top_k: int = Field(default=10, ge=1, le=500)
-
-
-class SkillsSearchRequest(BaseModel):
-    query: str
-    top_k: int = Field(default=5, ge=1, le=500)
-
-
-class KanbanCreateRequest(BaseModel):
-    title: str
-    description: str = ""
-    status: str = "todo"
-    priority: int = 0
-    tags: list[str] = Field(default_factory=list)
-    parent_id: int | None = None
-
-
-class KanbanUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str | None = None
-    description: str | None = None
-    status: str | None = None
-    priority: int | None = None
-    tags: list[str] | None = None
-    parent_id: int | None = None
-    metadata: dict[str, Any] | None = None
-
-
-class MetricRecordRequest(BaseModel):
-    name: str
-    value: float
-    labels: dict[str, str] = Field(default_factory=dict)
-
-
-class MetricQueryRequest(BaseModel):
-    name: str
-    start: str | None = None
-    end: str | None = None
-    limit: int = Field(default=100, ge=1, le=500)
-    aggregate_window: str | None = None
-
-
-class ObservationRecordRequest(BaseModel):
-    level: str
-    message: str
-    source: str | None = "http"
-    context: dict[str, Any] = Field(default_factory=dict)
-
-
-class ObservationQueryRequest(BaseModel):
-    level: str | None = None
-    source: str | None = None
-    start: str | None = None
-    end: str | None = None
-    limit: int = Field(default=100, ge=1, le=500)
-
-
-class SessionSearchRequest(BaseModel):
-    query: str
-    top_k: int = Field(default=10, ge=1, le=500)
+_PATH_PARAM_RE = re.compile(r"{(?P<name>[A-Za-z_]\w*)}")
 
 
 def service_dependency() -> IlmaMcpService:
@@ -258,6 +210,151 @@ def _health_payload(service: IlmaMcpService) -> dict[str, Any]:
     }
 
 
+def _registration_service(service: IlmaMcpService | None) -> IlmaMcpService:
+    """Return an object suitable for tools_dict() without opening a backend."""
+
+    if service is not None:
+        return service
+    return IlmaMcpService.__new__(IlmaMcpService)
+
+
+def _path_param_names(path: str) -> set[str]:
+    return {match.group("name") for match in _PATH_PARAM_RE.finditer(path)}
+
+
+def _route_tag(path: str) -> str:
+    if path in {"/search", "/remember", "/forget"} or path.startswith("/memories"):
+        return "memory"
+    if path.startswith("/observations"):
+        return "observability"
+    if path in {"/repair", "/doctor", "/migrate"}:
+        return "maintenance"
+    segment = path.strip("/").split("/", 1)[0]
+    return segment or "system"
+
+
+def _field_default(model: type[BaseModel], name: str) -> Any:
+    field = model.model_fields[name]
+    if field.is_required():
+        return ...
+    return field.default
+
+
+def _field_annotation(model: type[BaseModel], name: str) -> Any:
+    return model.model_fields[name].annotation or Any
+
+
+def _body_model_for_route(
+    tool_name: str, input_model: type[BaseModel], path_params: set[str]
+) -> type[BaseModel] | None:
+    body_fields = {
+        name: (_field_annotation(input_model, name), _field_default(input_model, name))
+        for name in input_model.model_fields
+        if name not in path_params
+    }
+    if not body_fields:
+        return None
+    return create_model(f"{tool_name}_HttpBody", **body_fields)
+
+
+def _route_signature(
+    *, input_model: type[BaseModel], path: str, method: str, body_model: type[BaseModel] | None
+) -> inspect.Signature:
+    path_params = _path_param_names(path)
+    parameters: list[inspect.Parameter] = [
+        inspect.Parameter("request", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Request),
+        inspect.Parameter(
+            "service",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            default=SERVICE_DEPENDENCY,
+            annotation=IlmaMcpService,
+        ),
+    ]
+    for name in sorted(path_params):
+        parameters.append(
+            inspect.Parameter(
+                name,
+                inspect.Parameter.KEYWORD_ONLY,
+                default=Path(...),
+                annotation=_field_annotation(input_model, name),
+            )
+        )
+    if method == "GET":
+        for name in input_model.model_fields:
+            if name in path_params:
+                continue
+            default = _field_default(input_model, name)
+            parameters.append(
+                inspect.Parameter(
+                    name,
+                    inspect.Parameter.KEYWORD_ONLY,
+                    default=Query(default),
+                    annotation=_field_annotation(input_model, name),
+                )
+            )
+    elif body_model is not None:
+        required = any(field.is_required() for field in body_model.model_fields.values())
+        parameters.append(
+            inspect.Parameter(
+                "body",
+                inspect.Parameter.KEYWORD_ONLY,
+                default=Body(...) if required else Body(None),
+                annotation=body_model,
+            )
+        )
+    return inspect.Signature(parameters, return_annotation=dict[str, Any])
+
+
+def _make_service_route_handler(
+    tool_name: str, input_model: type[BaseModel], path: str, method: str
+) -> Any:
+    path_params = _path_param_names(path)
+    body_model = (
+        None if method == "GET" else _body_model_for_route(tool_name, input_model, path_params)
+    )
+
+    async def service_route(
+        request: Request, service: IlmaMcpService = SERVICE_DEPENDENCY, **route_values: Any
+    ) -> dict[str, Any]:
+        body = route_values.pop("body", None)
+        payload: dict[str, Any] = body.model_dump() if isinstance(body, BaseModel) else {}
+        payload.update(route_values)
+        try:
+            model = input_model(**payload)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        handler = getattr(service, tool_name)
+        return handler(**model.model_dump())
+
+    service_route.__name__ = f"http_{tool_name}"
+    cast(Any, service_route).__signature__ = _route_signature(
+        input_model=input_model, path=path, method=method, body_model=body_model
+    )
+    return service_route
+
+
+def _register_service_routes(app: FastAPI, service: IlmaMcpService | None = None) -> int:
+    """Register FastAPI routes for service tools declared in _TOOL_TO_ROUTE."""
+
+    tools = tools_dict(_registration_service(service))
+    registered = 0
+    for tool_name, spec in sorted(tools.items()):
+        if tool_name in _HTTP_EXCLUDED:
+            continue
+        route = _TOOL_TO_ROUTE.get(tool_name)
+        if route is None:
+            continue
+        path, method = route
+        app.add_api_route(
+            path,
+            _make_service_route_handler(tool_name, spec["input_model"], path, method),
+            methods=[method],
+            tags=[_route_tag(path)],
+        )
+        registered += 1
+    return registered
+
+
 def create_app(service: IlmaMcpService | None = None) -> FastAPI:
     """Create the FastAPI app for the ilma REST API.
 
@@ -352,224 +449,7 @@ def create_app(service: IlmaMcpService | None = None) -> FastAPI:
 
         return service.ilma_status()
 
-    # Memory surface -----------------------------------------------------
-    @app.post("/search", tags=["memory"])
-    def search_memories(
-        request: SearchRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_search(request.query, request.top_k, request.hybrid_text_weight)
-
-    @app.post("/remember", tags=["memory"])
-    def remember(
-        request: RememberRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_remember(
-            request.content, request.tags, request.category, request.source
-        )
-
-    @app.post("/forget", tags=["memory"])
-    def forget(
-        request: ForgetRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_forget(request.memory_id)
-
-    @app.get("/memories/{memory_id}", tags=["memory"])
-    def get_memory(memory_id: int, service: IlmaMcpService = SERVICE_DEPENDENCY) -> dict[str, Any]:
-        return service.ilma_get_memory(memory_id)
-
-    @app.get("/memories", tags=["memory"])
-    def list_memories(
-        limit: int = Query(default=50, ge=1, le=500),
-        offset: int = Query(default=0, ge=0),
-        include_deleted: bool = False,
-        service: IlmaMcpService = SERVICE_DEPENDENCY,
-    ) -> dict[str, Any]:
-        return service.ilma_list_memories(limit, offset, include_deleted)
-
-    # Wiki surface -------------------------------------------------------
-    @app.post("/wiki/search", tags=["wiki"])
-    def search_wiki(
-        request: WikiSearchRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_search_wiki(request.query, request.top_k)
-
-    @app.get("/wiki", tags=["wiki"])
-    def list_wiki(
-        limit: int = Query(default=50, ge=1, le=500),
-        offset: int = Query(default=0, ge=0),
-        service: IlmaMcpService = SERVICE_DEPENDENCY,
-    ) -> dict[str, Any]:
-        return service.ilma_list_wiki(limit, offset)
-
-    @app.get("/wiki/{slug}", tags=["wiki"])
-    def get_wiki(slug: str, service: IlmaMcpService = SERVICE_DEPENDENCY) -> dict[str, Any]:
-        return service.ilma_get_wiki(slug)
-
-    @app.post("/wiki", tags=["wiki"])
-    def create_wiki(
-        request: WikiWriteRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_wiki_create(
-            request.slug,
-            request.title,
-            request.body_md,
-            request.category,
-            request.tags,
-            request.source_uri,
-        )
-
-    @app.patch("/wiki/{slug}", tags=["wiki"])
-    def update_wiki(
-        slug: str,
-        request: WikiWriteRequest,
-        service: IlmaMcpService = SERVICE_DEPENDENCY,
-    ) -> dict[str, Any]:
-        return service.ilma_wiki_update(
-            slug,
-            request.title,
-            request.body_md,
-            request.category,
-            request.tags,
-            request.source_uri,
-        )
-
-    # Journal surface ----------------------------------------------------
-    @app.post("/journal/search", tags=["journal"])
-    def search_journal(
-        request: JournalSearchRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_journal_search(request.query, request.top_k)
-
-    @app.get("/journal/recent", tags=["journal"])
-    def recent_journal(
-        limit: int = Query(default=10, ge=1, le=500),
-        service: IlmaMcpService = SERVICE_DEPENDENCY,
-    ) -> dict[str, Any]:
-        return service.ilma_journal_recent(limit)
-
-    # Skills surface -----------------------------------------------------
-    @app.post("/skills/search", tags=["skills"])
-    def search_skills(
-        request: SkillsSearchRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_skills_search(request.query, request.top_k)
-
-    @app.get("/skills/{name}", tags=["skills"])
-    def get_skill(name: str, service: IlmaMcpService = SERVICE_DEPENDENCY) -> dict[str, Any]:
-        return service.ilma_skills_get(name)
-
-    # Kanban surface -----------------------------------------------------
-    @app.get("/kanban", tags=["kanban"])
-    def list_kanban(
-        status: str = "todo",
-        limit: int = Query(default=50, ge=1, le=500),
-        service: IlmaMcpService = SERVICE_DEPENDENCY,
-    ) -> dict[str, Any]:
-        return service.ilma_kanban_list(status, limit)
-
-    @app.get("/kanban/{task_id}", tags=["kanban"])
-    def get_kanban(task_id: int, service: IlmaMcpService = SERVICE_DEPENDENCY) -> dict[str, Any]:
-        return service.ilma_kanban_get(task_id)
-
-    @app.post("/kanban", tags=["kanban"])
-    def create_kanban(
-        request: KanbanCreateRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_kanban_create(
-            request.title,
-            request.description,
-            request.status,
-            request.priority,
-            request.tags,
-            request.parent_id,
-        )
-
-    @app.patch("/kanban/{task_id}", tags=["kanban"])
-    def update_kanban(
-        task_id: int,
-        request: KanbanUpdateRequest,
-        service: IlmaMcpService = SERVICE_DEPENDENCY,
-    ) -> dict[str, Any]:
-        return service.ilma_kanban_update(
-            task_id,
-            request.title,
-            request.description,
-            request.status,
-            request.priority,
-            request.tags,
-            request.parent_id,
-            request.metadata,
-        )
-
-    @app.post("/kanban/{task_id}/complete", tags=["kanban"])
-    def complete_kanban(
-        task_id: int, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_kanban_complete(task_id)
-
-    # Metrics surface ----------------------------------------------------
-    @app.post("/metrics", tags=["metrics"])
-    def record_metric(
-        request: MetricRecordRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_metrics_record(request.name, request.value, request.labels)
-
-    @app.post("/metrics/query", tags=["metrics"])
-    def query_metrics(
-        request: MetricQueryRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_metrics_query(
-            request.name,
-            request.start,
-            request.end,
-            request.limit,
-            request.aggregate_window,
-        )
-
-    # Observability surface ---------------------------------------------
-    @app.post("/observations", tags=["observability"])
-    def record_observation(
-        request: ObservationRecordRequest,
-        service: IlmaMcpService = SERVICE_DEPENDENCY,
-    ) -> dict[str, Any]:
-        return service.ilma_obs_log(request.level, request.message, request.source, request.context)
-
-    @app.post("/observations/query", tags=["observability"])
-    def query_observations(
-        request: ObservationQueryRequest,
-        service: IlmaMcpService = SERVICE_DEPENDENCY,
-    ) -> dict[str, Any]:
-        return service.ilma_obs_query(
-            request.level, request.source, request.start, request.end, request.limit
-        )
-
-    # Sessions surface ---------------------------------------------------
-    @app.post("/sessions/search", tags=["sessions"])
-    def search_sessions(
-        request: SessionSearchRequest, service: IlmaMcpService = SERVICE_DEPENDENCY
-    ) -> dict[str, Any]:
-        return service.ilma_session_search(request.query, request.top_k)
-
-    @app.get("/sessions/{session_id}", tags=["sessions"])
-    def get_session(
-        session_id: str,
-        limit: int = Query(default=100, ge=1, le=500),
-        service: IlmaMcpService = SERVICE_DEPENDENCY,
-    ) -> dict[str, Any]:
-        return service.ilma_session_get(session_id, limit)
-
-    # Maintenance --------------------------------------------------------
-    @app.post("/repair", tags=["maintenance"])
-    def repair(service: IlmaMcpService = SERVICE_DEPENDENCY) -> dict[str, Any]:
-        return service.ilma_repair()
-
-    @app.post("/doctor", tags=["maintenance"])
-    def doctor(service: IlmaMcpService = SERVICE_DEPENDENCY) -> dict[str, Any]:
-        return service.ilma_doctor()
-
-    @app.post("/migrate", tags=["maintenance"])
-    def migrate(service: IlmaMcpService = SERVICE_DEPENDENCY) -> dict[str, Any]:
-        return service.ilma_migrate()
+    _register_service_routes(app, service)
 
     return app
 
