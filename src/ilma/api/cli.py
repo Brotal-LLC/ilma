@@ -20,6 +20,7 @@ import typer
 
 from ilma import __version__
 from ilma.api.mcp import IlmaConfigError, IlmaMcpService, _dsn_from_env, create_mcp_server
+from ilma.config import IlmaConfig
 from ilma.embeddings import EmbedderRegistry
 from ilma.migration import migrate_hermes_config, migrate_hermes_v2_schema
 from ilma.service import method_description, method_to_pydantic_model, tools_dict
@@ -299,11 +300,12 @@ def init_command(
         _finish_step() if not json_output else None
 
         _print_step(9, INIT_STEPS[8]) if not json_output else None
+        config = IlmaConfig.from_env()
         result["env"] = {
             "ILMA_DSN": "set",
-            "ILMA_EMBED_PROVIDER": os.environ.get("ILMA_EMBED_PROVIDER", "ollama_local"),
-            "ILMA_EMBED_MODEL": os.environ.get("ILMA_EMBED_MODEL", "bge-m3"),
-            "ILMA_EMBED_DIM": os.environ.get("ILMA_EMBED_DIM", "1024"),
+            "ILMA_EMBED_PROVIDER": config.vectors.embedder,
+            "ILMA_EMBED_MODEL": config.vectors.openai_model,
+            "ILMA_EMBED_DIM": str(config.vectors.dim),
         }
         result["steps"].append({"step": 9, "name": INIT_STEPS[8], "ok": True})
         _finish_step() if not json_output else None

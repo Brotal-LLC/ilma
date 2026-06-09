@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from typing import Protocol
 
 import httpx
+
+from ilma.config import IlmaConfig
 
 SUPPORTED_DIMS = (768, 1024, 1536)
 DEFAULT_DIM = 1024
@@ -114,29 +115,32 @@ class EmbedderRegistry:
 
     @classmethod
     def from_env(cls) -> EmbedderRegistry:
-        provider = os.environ.get("ILMA_EMBED_PROVIDER", "ollama_local").strip()
+        config = IlmaConfig.from_env()
+        provider = config.vectors.embedder.strip()
         if provider == "ollama_local":
-            base_url = os.environ.get("ILMA_EMBED_BASE_URL", "http://localhost:11434/v1")
-            dim = int(os.environ.get("ILMA_EMBED_DIM", "1024"))
-            model = os.environ.get(
-                "ILMA_EMBED_MODEL",
-                "bge-m3" if dim == 1024 else "nomic-embed-text-v2-moe",
+            base_url = config.vectors.base_url or "http://localhost:11434/v1"
+            dim = config.vectors.dim
+            model = config.vectors.openai_model or (
+                "bge-m3" if dim == 1024 else "nomic-embed-text-v2-moe"
             )
         elif provider == "openai":
-            base_url = os.environ.get("ILMA_EMBED_BASE_URL", "https://api.openai.com/v1")
-            dim = int(os.environ.get("ILMA_EMBED_DIM", "1536"))
-            model = os.environ.get("ILMA_EMBED_MODEL", "text-embedding-3-small")
+            base_url = config.vectors.base_url or "https://api.openai.com/v1"
+            dim = config.vectors.dim
+            model = config.vectors.openai_model
         elif provider == "http":
-            base_url = os.environ["ILMA_EMBED_BASE_URL"]
-            dim = int(os.environ["ILMA_EMBED_DIM"])
-            model = os.environ["ILMA_EMBED_MODEL"]
+            base_url = config.vectors.base_url
+            dim = config.vectors.dim
+            model = config.vectors.openai_model
+            if not base_url or not model:
+                msg = "http embedder requires ILMA_EMBED_BASE_URL and ILMA_EMBED_MODEL"
+                raise ValueError(msg)
         else:
             msg = (
                 f"unknown ILMA_EMBED_PROVIDER: {provider!r} "
                 "(expected ollama_local, openai, or http)"
             )
             raise ValueError(msg)
-        api_key = os.environ.get("ILMA_EMBED_API_KEY")
+        api_key = config.vectors.api_key
         embedder = HttpEmbedder(base_url=base_url, model=model, dim=dim, api_key=api_key)
         return cls({dim: embedder}, default_dim=dim)
 

@@ -8,7 +8,6 @@ this module.  No Hermes-specific imports belong here.
 from __future__ import annotations
 
 import inspect
-import os
 import re
 import time
 from typing import Any, cast
@@ -22,6 +21,7 @@ from ilma.api.hardening import (
     pool_size_from_backend,
 )
 from ilma.api.mcp import IlmaMcpService, get_service, set_service
+from ilma.config import IlmaConfig
 from ilma.service import tools_dict
 
 try:  # pragma: no cover - exercised only when optional HTTP dependencies are absent.
@@ -105,7 +105,7 @@ RATE_LIMIT_EXEMPT_PATHS = {"/health"}
 
 
 def _api_key_from_env() -> str | None:
-    value = os.environ.get("ILMA_API_KEY", "").strip()
+    value = (IlmaConfig.from_env().api.api_key or "").strip()
     return value or None
 
 
@@ -124,19 +124,12 @@ def api_key_dependency(request: Request) -> None:
 
 
 def _rate_limit_from_env() -> float:
-    value = os.environ.get("ILMA_RATE_LIMIT_RPS", "30").strip()
-    try:
-        parsed = float(value)
-    except ValueError:
-        return 30.0
+    parsed = IlmaConfig.from_env().api.rate_limit_rps
     return parsed if parsed >= 0 else 30.0
 
 
 def _cors_origins_from_env() -> list[str]:
-    value = os.environ.get("ILMA_CORS_ORIGINS", "*").strip()
-    if not value:
-        return ["*"]
-    origins = [origin.strip() for origin in value.split(",") if origin.strip()]
+    origins = [origin.strip() for origin in IlmaConfig.from_env().api.cors_origins if origin.strip()]
     return origins or ["*"]
 
 

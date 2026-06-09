@@ -11,8 +11,9 @@ import json
 import logging
 import os
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
+
+from ilma.config import IlmaConfig
 
 logger = logging.getLogger(__name__)
 
@@ -22,37 +23,18 @@ PROVIDER_LOCAL = "local"
 PROVIDER_AUTO = "auto"
 
 
-def _read_provider() -> str:
-    """Read memory.provider from env (priority) or ~/.hermes/config.yaml."""
-    env_val = os.environ.get("MEMORY_PROVIDER", "").strip().lower()
-    if env_val:
-        return env_val
-
-    hermes_home = os.environ.get("HERMES_HOME", "").strip() or os.path.expanduser("~/.hermes")
-    config_path = Path(hermes_home) / "config.yaml"
-    if not config_path.is_file():
-        return PROVIDER_LOCAL
-
-    try:
-        import yaml
-
-        with config_path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-    except Exception:
-        return PROVIDER_LOCAL
-
-    if not isinstance(data, dict):
-        return PROVIDER_LOCAL
-    memory_section = data.get("memory")
-    if not isinstance(memory_section, dict):
-        return PROVIDER_LOCAL
-    cfg_val = memory_section.get("provider")
-    if not isinstance(cfg_val, str):
-        return PROVIDER_LOCAL
-    cfg_val = cfg_val.strip().lower()
-    if cfg_val in (PROVIDER_ILMA, PROVIDER_POSTGRES, PROVIDER_LOCAL, PROVIDER_AUTO):
-        return cfg_val
+def read_memory_provider_from_config(config: IlmaConfig | None = None) -> str:
+    """Read and validate the configured Hermes memory provider."""
+    resolved = config or IlmaConfig.from_env()
+    provider = resolved.memory.provider.strip().lower()
+    if provider in (PROVIDER_ILMA, PROVIDER_POSTGRES, PROVIDER_LOCAL, PROVIDER_AUTO):
+        return provider
     return PROVIDER_LOCAL
+
+
+def _read_provider() -> str:
+    """Read memory.provider from unified ilma config sources."""
+    return read_memory_provider_from_config()
 
 
 def _passthrough_schema(name: str, description: str) -> dict[str, Any]:
@@ -87,21 +69,17 @@ def _try_build_service() -> Any | None:
         logger.warning("ilma: import failed: %s", exc)
         return None
 
-    dsn = (
-        os.environ.get("ILMA_DSN")
-        or os.environ.get("PG_MEM_DB_CONN_STR")
-        or os.environ.get("HERMES_PG_CONN_STR")
-    )
+    config = IlmaConfig.from_env()
+    dsn = config.postgres.dsn.strip()
     if not dsn:
         logger.warning(
-            "ilma: no DSN configured (ILMA_DSN / PG_MEM_DB_CONN_STR / HERMES_PG_CONN_STR)"
+            "ilma: no DSN configured (ILMA_PG_DSN / ILMA_DSN / PG_MEM_DB_CONN_STR / "
+            "HERMES_PG_CONN_STR)"
         )
         return None
 
-    min_pool_size = int(os.environ.get("ILMA_PG_POOL_MIN", "1"))
-    max_pool_size = int(os.environ.get("ILMA_PG_POOL_MAX", "8"))
     try:
-        backend = PgBackend(dsn, min_pool_size=min_pool_size, max_pool_size=max_pool_size)
+        backend = PgBackend(dsn, min_pool_size=1, max_pool_size=config.postgres.pool_size)
         return IlmaMcpService(backend)
     except Exception as exc:
         logger.warning("ilma: service construction failed: %s", exc)
