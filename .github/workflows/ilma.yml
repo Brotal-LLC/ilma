@@ -1,0 +1,270 @@
+# ==============================================================================
+# ilma — single gated workflow
+#
+# Consolidates lint + test + security + tag + build + release into one file.
+# Mirrors the phased structure of skb50bd/sv/.github/workflows/sv.yml.
+#
+# INTENTIONALLY EXCLUDED (vs. sv):
+#   - Deploy job. The user has directed that ilma is distributed as a package
+#     (PyPI + GHCR image) and the CI flow must NOT mutate the user's local
+#     installation. Deploy-to-ilma.aamar.cloud is a local manual step via
+#     ~/infra/scripts/deploy-ilma.sh, not a CI/CD concern.
+#   - PyPI publish. No PYPI_API_TOKEN secret is configured. Adding a job that
+#     fails on every release due to a missing secret is noise; re-add when the
+#     user provisions a PyPI trusted publisher.
+#   - Coverage gate. No coverage tooling is configured; re-add when
+#     pytest-cov is in pyproject.toml [dependency-groups.dev].
+#   - E2E job. The unit tests + the post-deploy smoke test (when the user runs
+#     it manually) are sufficient for v0.2.0.
+# ==============================================================================
+
+name: ilma
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Dockerfile"
+      - "docker/**"
+      - ".github/workflows/ilma.yml"
+      - ".github/actionlint.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Dockerfile"
+      - "docker/**"
+      - ".github/workflows/ilma.yml"
+      - ".github/actionlint.yaml"
+  workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: "Also publish to PyPI (requires PYPI_API_TOKEN secret)"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: ilma-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Suppresses "Node 16/20 deprecated" warnings emitted by JS-based actions
+  # (e.g. actions/checkout). Matches sv/.github/workflows/sv.yml:37.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+# ==============================================================================
+# PHASE 1 — Lint (PR + push, ~30s)
+# Cheap, parallel checks. Fails fast on syntax / formatting.
+# ==============================================================================
+jobs:
+  lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: actionlint
+        uses: reviewdog/action-actionlint@v1
+        with:
+          fail_level: error
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: uv sync --python 3.11 --extra http --extra mcp --group dev
+        env:
+          UV_LINK_MODE: copy
+
+      - name: Ruff check
+        run: uv run ruff check src/ tests/
+
+      - name: Ruff format check
+        run: uv run ruff format --check src/ tests/
+
+      - name: Mypy
+        run: uv run mypy src/ilma --ignore-missing-imports
+
+# ==============================================================================
+# PHASE 2 — Test (PR + push, ~2-3 min, parallel with lint)
+# Matrix 3.11 + 3.12 against a throwaway pgvector service. The runner's
+# ephemeral venv is independent of the user's local install.
+# ==============================================================================
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ilma
+          POSTGRES_PASSWORD: ilma
+          POSTGRES_DB: ilma_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+          enable-cache: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: uv sync --python "${{ matrix.python-version }}" --extra http --extra mcp --group dev
+        env:
+          UV_LINK_MODE: copy
+      - name: Test
+        env:
+          ILMA_DSN: postgresql://ilma:***@localhost:5432/ilma_test
+        run: uv run pytest tests/ -v --tb=short
+
+# ==============================================================================
+# PHASE 3 — Security (PR + push, parallel with test, ~1 min)
+# TruffleHog for verified-secret scanning. hadolint already runs in the lint
+# phase, so we don't duplicate it here.
+# ==============================================================================
+  security:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: TruffleHog secret scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+# ==============================================================================
+# PHASE 4 — Tag (push to main only, ~5s)
+# Compute the short commit SHA so downstream build jobs tag the GHCR image
+# consistently. Mirrors sv.yml:365-384.
+# ==============================================================================
+  tag:
+    needs: [lint, test, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      build_tag: ${{ steps.sha.outputs.value }}
+    steps:
+      - name: Use short commit SHA as tag
+        id: sha
+        run: |
+          SHORT="${GITHUB_SHA::7}"
+          echo "value=${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "Build tag: ${SHORT}"
+
+# ==============================================================================
+# PHASE 5 — Build & publish image (push to main only, gated on tag)
+# Single image (ghcr.io/<owner>/ilma) tagged with the short SHA + `main` +
+# `latest`. Layer-cached via GHA cache.
+# ==============================================================================
+  build:
+    needs: [tag]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository_owner }}/ilma
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=sha
+            type=raw,value=main,enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+# ==============================================================================
+# PHASE 6 — Release (push `v*` tag only, gated on build)
+# Auto-generates GitHub release notes from merged PRs. Does NOT publish to
+# PyPI (no PYPI_API_TOKEN secret configured) and does NOT deploy to
+# ilma.aamar.cloud (user OOB: CI must not mutate local environment).
+# ==============================================================================
+  release:
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --title "Release $TAG" \
+            --generate-notes
