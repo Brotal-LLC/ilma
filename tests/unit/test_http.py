@@ -25,15 +25,23 @@ class FakeHttpService:
             "backend": {"ok": True, "database": "fake", "pgvector": True},
             "memory": {"total_memories": len(self.memories)},
             "surfaces": SURFACES,
-            "tool_count": 30,
+            "tool_count": 29,
         }
 
-    def ilma_search(
-        self, query: str, top_k: int = 10, hybrid_text_weight: float = 0.5
+    def ilma_recall(
+        self,
+        query: str,
+        limit: int = 10,
+        threshold: float = 0.0,
+        hybrid_text_weight: float = 0.5,
     ) -> dict[str, Any]:
+        results = [m for m in self.memories if query.lower() in m["content"].lower()][:limit]
         return {
             "ok": True,
-            "results": [m for m in self.memories if query.lower() in m["content"].lower()][:top_k],
+            "results": results,
+            "count": len(results),
+            "query": query,
+            "limit": limit,
         }
 
     def ilma_remember(
@@ -65,7 +73,7 @@ class FakeHttpService:
     ) -> dict[str, Any]:
         return {"ok": True, "results": self.memories[offset : offset + limit]}
 
-    def ilma_search_wiki(self, query: str, top_k: int = 5) -> dict[str, Any]:
+    def ilma_wiki_search(self, query: str, top_k: int = 5) -> dict[str, Any]:
         return {
             "ok": True,
             "results": [
@@ -251,7 +259,7 @@ def test_health_status_and_openapi(client: TestClient) -> None:
 
     status = assert_ok(client.get("/status"))
     assert status["surfaces"] == SURFACES
-    assert status["tool_count"] == 30
+    assert status["tool_count"] == 29
 
     spec = client.get("/openapi.json")
     assert spec.status_code == 200
@@ -259,7 +267,7 @@ def test_health_status_and_openapi(client: TestClient) -> None:
     for path in [
         "/health",
         "/status",
-        "/search",
+        "/recall",
         "/remember",
         "/forget",
         "/memories/{memory_id}",
@@ -300,8 +308,8 @@ def test_memory_routes(client: TestClient) -> None:
     )
     assert remembered["memory_id"] == 2
 
-    search = assert_ok(client.post("/search", json={"query": "dark", "top_k": 3}))
-    assert search["results"][0]["content"] == "User prefers dark mode"
+    recall = assert_ok(client.post("/recall", json={"query": "dark", "limit": 3}))
+    assert recall["results"][0]["content"] == "User prefers dark mode"
 
     memory = assert_ok(client.get("/memories/1"))
     assert memory["memory"]["content"] == "User prefers dark mode"

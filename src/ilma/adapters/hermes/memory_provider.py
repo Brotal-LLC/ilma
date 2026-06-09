@@ -85,13 +85,9 @@ class IlmaMemoryProvider(MemoryProvider):
 
         service = self._require_service()
         recall = getattr(service, "ilma_recall", None)
-        if callable(recall):
-            result = recall(query=query, limit=5)
-        else:
-            search = getattr(service, "ilma_search", None)
-            if not callable(search):
-                return ""
-            result = search(query=query, top_k=5)
+        if not callable(recall):
+            return ""
+        result = recall(query=query, limit=5)
         return _format_prefetch_context(result)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:

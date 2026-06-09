@@ -133,7 +133,7 @@ def test_hermes_adapter_memory_crud_hooks_and_postgres_persistence(
     assert "pre_tool_call" in ctx.hooks
     assert "on_session_end" in ctx.hooks
     assert "ilma_remember" in ctx.tools
-    assert "ilma_search" in ctx.tools
+    assert "ilma_recall" in ctx.tools
 
     memory = ctx.tools["memory"]["handler"]
     add = json.loads(

@@ -31,14 +31,24 @@ class FakeService:
             "backend": {"ok": True, "database": "ilma_test", "pgvector": True},
             "memory": {"total_memories": 1, "live_memories": 1, "total_chunks": 1},
             "surfaces": list(cli.SURFACES),
-            "tool_count": 30,
+            "tool_count": 29,
         }
 
-    def ilma_search(
-        self, query: str, top_k: int = 10, hybrid_text_weight: float = 0.5
+    def ilma_recall(
+        self,
+        query: str,
+        limit: int = 10,
+        threshold: float = 0.0,
+        hybrid_text_weight: float = 0.5,
     ) -> dict[str, Any]:
-        self.calls.append(("search", (query, top_k, hybrid_text_weight)))
-        return {"ok": True, "results": self.memories if query else []}
+        self.calls.append(("recall", (query, limit, threshold, hybrid_text_weight)))
+        return {
+            "ok": True,
+            "results": self.memories if query else [],
+            "count": len(self.memories) if query else 0,
+            "query": query,
+            "limit": limit,
+        }
 
     def ilma_remember(
         self,
@@ -170,7 +180,7 @@ def test_help_lists_required_commands() -> None:
     for command in [
         "init",
         "status",
-        "search",
+        "recall",
         "remember",
         "forget",
         "doctor",
@@ -205,12 +215,13 @@ def test_memory_commands_call_service_and_render_human_output(monkeypatch: Any) 
     service = FakeService()
     monkeypatch.setattr(cli, "_service_from_env", lambda: service)
 
-    search_result = runner.invoke(
-        cli.app, ["search", "dark", "--top-k", "3", "--hybrid-text-weight", "0.25"]
+    recall_result = runner.invoke(
+        cli.app,
+        ["recall", "dark", "--limit", "3", "--hybrid-text-weight", "0.25"],
     )
-    assert search_result.exit_code == 0
-    assert "[1] User prefers dark mode" in search_result.output
-    assert service.calls[-1] == ("search", ("dark", 3, 0.25))
+    assert recall_result.exit_code == 0
+    assert "[1] User prefers dark mode" in recall_result.output
+    assert service.calls[-1] == ("recall", ("dark", 3, 0.0, 0.25))
 
     remember_result = runner.invoke(
         cli.app,
@@ -257,13 +268,17 @@ def test_repair_migrate_and_audit_json(monkeypatch: Any) -> None:
 
 def test_failed_service_result_exits_nonzero(monkeypatch: Any) -> None:
     class BrokenService(FakeService):
-        def ilma_search(
-            self, query: str, top_k: int = 10, hybrid_text_weight: float = 0.5
+        def ilma_recall(
+            self,
+            query: str,
+            limit: int = 10,
+            threshold: float = 0.0,
+            hybrid_text_weight: float = 0.5,
         ) -> dict[str, Any]:
             return {"ok": False, "error": {"type": "RuntimeError", "message": "boom"}}
 
     monkeypatch.setattr(cli, "_service_from_env", BrokenService)
-    result = runner.invoke(cli.app, ["search", "x"])
+    result = runner.invoke(cli.app, ["recall", "x"])
     assert result.exit_code == 1
     assert "RuntimeError: boom" in result.output
 

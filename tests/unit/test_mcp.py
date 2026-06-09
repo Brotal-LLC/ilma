@@ -259,12 +259,12 @@ async def test_mcp_server_registration_is_driven_by_tools_dict_loop(
 
     assert set(tools) == set(WRITE_TOOLS) | {
         "ilma_status",
-        "ilma_search",
+        "ilma_recall",
         "ilma_recent",
         "ilma_get_memory",
         "ilma_list_memories",
         "ilma_get_wiki",
-        "ilma_search_wiki",
+        "ilma_wiki_search",
         "ilma_list_wiki",
         "ilma_journal_search",
         "ilma_journal_recent",
@@ -278,11 +278,11 @@ async def test_mcp_server_registration_is_driven_by_tools_dict_loop(
         "ilma_session_get",
         "ilma_doctor",
     }
-    assert tools["ilma_search"].inputSchema["required"] == ["query"]
-    assert "hybrid_text_weight" in tools["ilma_search"].inputSchema["properties"]
+    assert tools["ilma_recall"].inputSchema["required"] == ["query"]
+    assert "hybrid_text_weight" in tools["ilma_recall"].inputSchema["properties"]
 
     import json
-    result = await server.call_tool("ilma_search", {"query": "dark"})
+    result = await server.call_tool("ilma_recall", {"query": "dark"})
     # FastMCP >=1.0 returns a list of TextContent blocks; the JSON
     # payload is in result[0].text. Cast to TextContent for type-checkers.
     structured = json.loads(cast(TextContent, result[0]).text)
@@ -305,21 +305,21 @@ async def test_mcp_server_write_tool_audits_once(service: IlmaMcpService) -> Non
 
 
 @pytest.mark.asyncio
-async def test_mcp_server_registers_expected_30_tools(service: IlmaMcpService) -> None:
+async def test_mcp_server_registers_expected_29_tools(service: IlmaMcpService) -> None:
     server = create_mcp_server(service)
     tools = await server.list_tools()
     names = {tool.name for tool in tools}
-    assert len(names) == TOOL_COUNT == 30
+    assert len(names) == TOOL_COUNT
     assert names == {
         "ilma_status",
-        "ilma_search",
+        "ilma_recall",
         "ilma_recent",
         "ilma_get_memory",
         "ilma_list_memories",
         "ilma_remember",
         "ilma_forget",
         "ilma_get_wiki",
-        "ilma_search_wiki",
+        "ilma_wiki_search",
         "ilma_list_wiki",
         "ilma_wiki_create",
         "ilma_wiki_update",
@@ -346,12 +346,12 @@ async def test_mcp_server_registers_expected_30_tools(service: IlmaMcpService) -
 
 def test_read_tools_return_structured_success(service: IlmaMcpService) -> None:
     assert service.ilma_status()["ok"] is True
-    assert service.ilma_search("dark")["ok"] is True
+    assert service.ilma_recall("dark")["ok"] is True
     assert service.ilma_recent()["ok"] is True
     assert service.ilma_get_memory(1)["memory"]["content"] == "User prefers dark mode"
     assert service.ilma_list_memories()["ok"] is True
     assert service.ilma_get_wiki("intro")["document"]["title"] == "Intro"
-    assert service.ilma_search_wiki("Intro")["ok"] is True
+    assert service.ilma_wiki_search("Intro")["ok"] is True
     assert service.ilma_list_wiki()["ok"] is True
     assert service.ilma_journal_search("x")["ok"] is True
     assert service.ilma_journal_recent()["ok"] is True
@@ -414,12 +414,12 @@ def test_errors_are_structured_and_failed_writes_are_audited(service: IlmaMcpSer
 
 
 def test_tool_calls_are_structured_logged(service: IlmaMcpService) -> None:
-    result = service.ilma_search("dark")
+    result = service.ilma_recall("dark")
     assert result["ok"] is True
     assert service.backend.observability.logged
     record = service.backend.observability.logged[-1]
     assert record["source"] == "mcp.tool"
-    assert record["context"]["tool_name"] == "ilma_search"
+    assert record["context"]["tool_name"] == "ilma_recall"
     assert record["context"]["success"] is True
 
 

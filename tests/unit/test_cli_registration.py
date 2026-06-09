@@ -10,10 +10,20 @@ class RegistrationService:
     def ilma_status(self) -> dict[str, Any]:
         return {"ok": True}
 
-    def ilma_search(
-        self, query: str, top_k: int = 10, hybrid_text_weight: float = 0.5
+    def ilma_recall(
+        self,
+        query: str,
+        limit: int = 10,
+        threshold: float = 0.0,
+        hybrid_text_weight: float = 0.5,
     ) -> dict[str, Any]:
-        return {"ok": True, "query": query, "top_k": top_k, "hybrid_text_weight": hybrid_text_weight}
+        return {
+            "ok": True,
+            "query": query,
+            "limit": limit,
+            "threshold": threshold,
+            "hybrid_text_weight": hybrid_text_weight,
+        }
 
     def ilma_remember(
         self,
@@ -81,7 +91,7 @@ def test_expected_service_commands_are_auto_registered() -> None:
 
     assert auto_registered == {
         "status",
-        "search",
+        "recall",
         "remember",
         "forget",
         "doctor",

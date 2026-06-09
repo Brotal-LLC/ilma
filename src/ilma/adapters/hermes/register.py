@@ -187,7 +187,7 @@ def _register_memory_override(ctx: Any, service: Any | None) -> None:
                 return json.dumps(
                     {"error": "validation_error", "message": "search requires 'query'"}
                 )
-            result = service.ilma_search(query, top_k=kwargs.get("top_k", 10))
+            result = service.ilma_recall(query=query, limit=kwargs.get("top_k", 10))
             return json.dumps(result)
         if action == "remove":
             memory_id = kwargs.get("memory_id")

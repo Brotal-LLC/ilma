@@ -54,7 +54,7 @@ class FakeService:
     def ilma_status(self) -> dict[str, Any]:
         return {"ok": True, **self.memory.status()}
 
-    def ilma_search(self, query: str, **kwargs: Any) -> dict[str, Any]:
+    def ilma_recall(self, query: str, **kwargs: Any) -> dict[str, Any]:
         return {"ok": True, "results": self.memory.search(query, **kwargs)}
 
     def ilma_remember(self, content: str, **kwargs: Any) -> dict[str, Any]:

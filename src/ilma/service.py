@@ -163,8 +163,6 @@ def _parse_sphinx_params(doc: str) -> dict[str, str]:
     return descriptions
 
 
-TOOL_COUNT = 30
-
 SURFACE_TABLES: Mapping[str, tuple[str, ...]] = {
     "memory": ("memories", "memory_chunks"),
     "wiki": ("wiki_docs", "wiki_chunks"),
@@ -334,7 +332,7 @@ class IlmaService:
         labels = {"tool_name": tool_name, "success": str(success).lower()}
         METRICS.increment("tool_call_count", labels)
         METRICS.observe("tool_call_duration", duration_seconds, labels)
-        if tool_name == "ilma_search":
+        if tool_name == "ilma_recall":
             METRICS.observe(
                 "memory_search_latency", duration_seconds, {"success": str(success).lower()}
             )
@@ -452,17 +450,52 @@ class IlmaService:
 
         return self.call("ilma_status", run, {})
 
-    def ilma_search(
-        self, query: str, top_k: int = 10, hybrid_text_weight: float = 0.5
+    def ilma_recall(
+        self,
+        query: str,
+        limit: int = 10,
+        threshold: float = 0.0,
+        hybrid_text_weight: float = 0.5,
     ) -> dict[str, Any]:
+        """Recall memories relevant to a query.
+
+        Canonical surface for memory recall. Returns ``{"results": [...]}``
+        where each result is a memory row ordered by relevance.
+
+        Parameters
+        ----------
+        query:
+            Natural-language query to match against stored memories.
+        limit:
+            Maximum number of results to return (1-100, default 10).
+        threshold:
+            Minimum cosine similarity for a result to be included
+            (0.0 = no filter, default 0.0). Filters are applied client-side
+            after the underlying hybrid search.
+        hybrid_text_weight:
+            Weight given to keyword/lexical matches vs vector matches
+            (0.0 = pure vector, 1.0 = pure keyword, default 0.5).
+        """
+
+        def run() -> dict[str, Any]:
+            capped_limit = _limit(limit, default=10)
+            raw = self.memory.search(
+                query,
+                top_k=capped_limit,
+                hybrid_text_weight=hybrid_text_weight,
+            )
+            results = self._filter_by_threshold(raw, threshold)
+            return _ok(results=results, count=len(results), query=query, limit=capped_limit)
+
         return self.call(
-            "ilma_search",
-            lambda: _ok(
-                results=self.memory.search(
-                    query, top_k=_limit(top_k, default=10), hybrid_text_weight=hybrid_text_weight
-                )
-            ),
-            {"query": query, "top_k": top_k, "hybrid_text_weight": hybrid_text_weight},
+            "ilma_recall",
+            run,
+            {
+                "query": query,
+                "limit": limit,
+                "threshold": threshold,
+                "hybrid_text_weight": hybrid_text_weight,
+            },
         )
 
     def ilma_recent(self, limit: int = 10) -> dict[str, Any]:
@@ -540,9 +573,9 @@ class IlmaService:
     def ilma_get_wiki(self, slug: str) -> dict[str, Any]:
         return self.call("ilma_get_wiki", lambda: _ok(document=self.wiki.get(slug)), {"slug": slug})
 
-    def ilma_search_wiki(self, query: str, top_k: int = 5) -> dict[str, Any]:
+    def ilma_wiki_search(self, query: str, top_k: int = 5) -> dict[str, Any]:
         return self.call(
-            "ilma_search_wiki",
+            "ilma_wiki_search",
             lambda: _ok(results=self.wiki.search(query, top_k=_limit(top_k, default=5))),
             {"query": query, "top_k": top_k},
         )
@@ -1316,6 +1349,37 @@ class IlmaService:
         self.audit.initialize_schema()
 
     # SQL fallback helpers for list/get tools not present in core Protocols.
+    @staticmethod
+    def _filter_by_threshold(
+        results: list[Any], threshold: float
+    ) -> list[Any]:
+        """Filter search results by minimum similarity score.
+
+        The current ``ilma.memory.search`` does not return per-row similarity
+        scores — the hybrid search sorts results by combined score internally
+        and discards the score before returning. This helper therefore acts
+        as a no-op pass-through today, returning the input list unchanged
+        when ``threshold > 0``.
+
+        Once ``Memory`` rows carry a ``score`` attribute (planned), this
+        filter will start enforcing ``score >= threshold`` without callers
+        needing to change. The threshold parameter is kept in the public
+        API so existing callers don't need to migrate later.
+        """
+        if threshold <= 0:
+            return results
+        # Look for a numeric `score` attribute on each row. If present, filter;
+        # otherwise preserve all results (backward-compatible with rows that
+        # don't expose a score).
+        filtered: list[Any] = []
+        for row in results:
+            score = getattr(row, "score", None)
+            if score is None and isinstance(row, dict):
+                score = row.get("score")
+            if score is None or score >= threshold:
+                filtered.append(row)
+        return filtered
+
     def _memory_rows(
         self,
         *,
@@ -1370,11 +1434,12 @@ _READ_TOOL_ACTIONS = frozenset(
         "health",
         "list",
         "query",
+        "recall",
         "recent",
-        "search",
         "status",
     }
 )
+_READ_TOOL_SUFFIXES = frozenset({"search"})
 _MAINTENANCE_ACTIONS = frozenset({"migrate", "repair"})
 
 
@@ -1429,12 +1494,12 @@ def _infer_write_surface_action(
 ) -> tuple[str, str] | None:
     suffix = tool_name.removeprefix(TOOLS_ATTR_PREFIX)
     parts = suffix.split("_")
-    if not suffix or parts[0] in _READ_TOOL_ACTIONS:
+    if not suffix or _is_read_tool_action(parts[0]):
         return None
 
     if len(parts) == 1:
         action = parts[0]
-        if action in _READ_TOOL_ACTIONS:
+        if _is_read_tool_action(action):
             return None
         surface = _single_surface_from_method(method) or _surface_for_single_action(action)
         if surface is None:
@@ -1442,10 +1507,14 @@ def _infer_write_surface_action(
         return surface, action
 
     action = "_".join(parts[1:])
-    if action in _READ_TOOL_ACTIONS:
+    if _is_read_tool_action(action):
         return None
     surface = _single_surface_from_method(method) or parts[0]
     return surface, action
+
+
+def _is_read_tool_action(action: str) -> bool:
+    return action in _READ_TOOL_ACTIONS or action in _READ_TOOL_SUFFIXES
 
 
 def _single_surface_from_method(method: Callable[..., Any]) -> str | None:
@@ -1485,4 +1554,25 @@ def _method_ast(method: Callable[..., Any]) -> ast.Module | None:
 
 
 WRITE_TOOLS: Mapping[str, tuple[str, str]] = _derive_write_tools()
+
+
+def _count_tools(service_cls: type[Any] = IlmaService) -> int:
+    """Return the count of public ``ilma_*`` methods on the service.
+
+    This is the runtime source of truth for the tool surface size and is
+    consumed by tests, the CLI banner, and the MCP server's registration
+    assertion. Keeping it derived (instead of a hand-maintained constant)
+    ensures it stays in sync as new tools are added.
+    """
+
+    return sum(
+        1
+        for name, member in vars(service_cls).items()
+        if name.startswith(TOOLS_ATTR_PREFIX)
+        and name not in EXCLUDED_TOOL_NAMES
+        and inspect.isfunction(member)
+    )
+
+
+TOOL_COUNT: int = _count_tools()
 

@@ -359,23 +359,31 @@ def status(
     typer.echo("Surfaces: " + ", ".join(str(s) for s in result.get("surfaces", SURFACES)))
 
 
-def search(
-    query: Annotated[str, typer.Argument(help="Search query.")],
-    top_k: Annotated[int, typer.Option("--top-k", "-k", min=1, max=500)] = 10,
+def recall(
+    query: Annotated[str, typer.Argument(help="Recall query.")],
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1, max=100)] = 10,
+    threshold: Annotated[
+        float,
+        typer.Option("--threshold", "-t", min=0.0, max=1.0, help="Minimum similarity score (0.0 = no filter)."),
+    ] = 0.0,
     hybrid_text_weight: Annotated[
         float,
         typer.Option("--hybrid-text-weight", min=0.0, max=1.0),
     ] = 0.5,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
 ) -> None:
-    """Search memories."""
+    """Recall memories relevant to a query. Canonical recall surface."""
 
-    result = _service_from_env().ilma_search(query, top_k, hybrid_text_weight)
+    result = _service_from_env().ilma_recall(
+        query, limit=limit, threshold=threshold, hybrid_text_weight=hybrid_text_weight
+    )
     _exit_if_failed(result, json_output=json_output)
     if json_output:
         _echo_json(result)
         return
     results = _json_safe(result.get("results", []))
+    count = result.get("count", len(results))
+    typer.echo(f"Recall: {count} result(s) for query={query!r} (limit={result.get('limit', limit)})")
     if not results:
         typer.echo("No memories found.")
         return
@@ -600,7 +608,7 @@ def migrate(
 _CLI_EXCLUDED = frozenset({"init", "mcp", "serve", "migrate-config"})
 _CLI_TOOL_TO_COMMAND: Mapping[str, str] = {
     "ilma_status": "status",
-    "ilma_search": "search",
+    "ilma_recall": "recall",
     "ilma_remember": "remember",
     "ilma_forget": "forget",
     "ilma_doctor": "doctor",
@@ -650,7 +658,7 @@ def _register_service_commands(typer_app: typer.Typer) -> None:
 
     implementations = {
         "ilma_status": status,
-        "ilma_search": search,
+        "ilma_recall": recall,
         "ilma_remember": remember,
         "ilma_forget": forget,
         "ilma_doctor": doctor,

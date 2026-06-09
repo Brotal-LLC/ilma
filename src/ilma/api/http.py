@@ -49,13 +49,13 @@ SURFACES = [
 
 _TOOL_TO_ROUTE: dict[str, tuple[str, str]] = {
     "ilma_status": ("/status", "GET"),
-    "ilma_search": ("/search", "POST"),
+    "ilma_recall": ("/recall", "POST"),
     "ilma_remember": ("/remember", "POST"),
     "ilma_forget": ("/forget", "POST"),
     "ilma_get_memory": ("/memories/{memory_id}", "GET"),
     "ilma_list_memories": ("/memories", "GET"),
     "ilma_get_wiki": ("/wiki/{slug}", "GET"),
-    "ilma_search_wiki": ("/wiki/search", "POST"),
+    "ilma_wiki_search": ("/wiki/search", "POST"),
     "ilma_list_wiki": ("/wiki", "GET"),
     "ilma_wiki_create": ("/wiki", "POST"),
     "ilma_wiki_update": ("/wiki/{slug}", "PATCH"),
@@ -216,7 +216,7 @@ def _path_param_names(path: str) -> set[str]:
 
 
 def _route_tag(path: str) -> str:
-    if path in {"/search", "/remember", "/forget"} or path.startswith("/memories"):
+    if path in {"/recall", "/remember", "/forget"} or path.startswith("/memories"):
         return "memory"
     if path.startswith("/observations"):
         return "observability"
