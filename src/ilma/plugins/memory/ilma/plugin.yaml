@@ -1,0 +1,4 @@
+name: ilma
+version: 0.2.0
+kind: exclusive
+description: Postgres-backed vector memory provider
