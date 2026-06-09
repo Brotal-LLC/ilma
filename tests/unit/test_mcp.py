@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import pytest
+from mcp.types import TextContent
 
 from ilma.api.mcp import (
     TOOL_COUNT,
@@ -243,6 +245,63 @@ def test_dsn_from_env_prefers_ilma_and_supports_migration_fallback() -> None:
     assert _dsn_from_env(fallback) == "postgresql://legacy"
     with pytest.raises(IlmaConfigError):
         _dsn_from_env({})
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_registration_is_driven_by_tools_dict_loop(
+    service: IlmaMcpService,
+) -> None:
+    source = Path("src/ilma/api/mcp.py").read_text()
+    assert "@server.tool" not in source
+
+    server = create_mcp_server(service)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+
+    assert set(tools) == set(WRITE_TOOLS) | {
+        "ilma_status",
+        "ilma_search",
+        "ilma_recent",
+        "ilma_get_memory",
+        "ilma_list_memories",
+        "ilma_get_wiki",
+        "ilma_search_wiki",
+        "ilma_list_wiki",
+        "ilma_journal_search",
+        "ilma_journal_recent",
+        "ilma_skills_search",
+        "ilma_skills_get",
+        "ilma_kanban_list",
+        "ilma_kanban_get",
+        "ilma_metrics_query",
+        "ilma_obs_query",
+        "ilma_session_search",
+        "ilma_session_get",
+        "ilma_doctor",
+    }
+    assert tools["ilma_search"].inputSchema["required"] == ["query"]
+    assert "hybrid_text_weight" in tools["ilma_search"].inputSchema["properties"]
+
+    import json
+    result = await server.call_tool("ilma_search", {"query": "dark"})
+    # FastMCP >=1.0 returns a list of TextContent blocks; the JSON
+    # payload is in result[0].text. Cast to TextContent for type-checkers.
+    structured = json.loads(cast(TextContent, result[0]).text)
+    assert isinstance(structured, dict)
+    assert structured["ok"] is True
+    assert structured["results"][0]["content"] == "User prefers dark mode"
+@pytest.mark.asyncio
+async def test_mcp_server_write_tool_audits_once(service: IlmaMcpService) -> None:
+    server = create_mcp_server(service)
+
+    import json
+    result = await server.call_tool("ilma_remember", {"content": "from mcp"})
+    structured = json.loads(cast(TextContent, result[0]).text)
+
+    assert isinstance(structured, dict)
+    assert structured["ok"] is True
+    audit_logger = service.audit
+    assert isinstance(audit_logger, InMemoryAuditLogger)
+    assert [record["tool_name"] for record in audit_logger.records] == ["ilma_remember"]
 
 
 @pytest.mark.asyncio
