@@ -7,13 +7,14 @@ standard third-party CLI/runtime packages.  It does not depend on Hermes Agent.
 from __future__ import annotations
 
 import csv
+import inspect
 import io
 import json
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, cast, get_type_hints
 
 import typer
 
@@ -21,6 +22,7 @@ from ilma import __version__
 from ilma.api.mcp import IlmaConfigError, IlmaMcpService, _dsn_from_env, create_mcp_server
 from ilma.embeddings import EmbedderRegistry
 from ilma.migration import migrate_hermes_config, migrate_hermes_v2_schema
+from ilma.service import method_description, method_to_pydantic_model, tools_dict
 from ilma.storage.postgres import PgBackend
 
 try:  # psycopg is a core dependency, but keep import failure user-friendly.
@@ -326,7 +328,6 @@ def init_command(
         typer.echo("Set ILMA_DSN in your environment to use ilma from other shells.")
 
 
-@app.command()
 def status(
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
 ) -> None:
@@ -356,7 +357,6 @@ def status(
     typer.echo("Surfaces: " + ", ".join(str(s) for s in result.get("surfaces", SURFACES)))
 
 
-@app.command()
 def search(
     query: Annotated[str, typer.Argument(help="Search query.")],
     top_k: Annotated[int, typer.Option("--top-k", "-k", min=1, max=500)] = 10,
@@ -389,7 +389,6 @@ def search(
         typer.echo(f"    category={category} tags={', '.join(map(str, tags)) if tags else '-'}")
 
 
-@app.command()
 def remember(
     content: Annotated[str, typer.Argument(help="Memory content to store.")],
     tags: Annotated[
@@ -413,7 +412,6 @@ def remember(
         typer.echo("Memory already exists; no duplicate stored.")
 
 
-@app.command()
 def forget(
     memory_id: Annotated[int, typer.Argument(help="Memory ID to soft-delete.", min=1)],
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
@@ -431,7 +429,6 @@ def forget(
         typer.echo(f"Memory {memory_id} was not found or was already deleted.")
 
 
-@app.command()
 def doctor(
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
 ) -> None:
@@ -459,7 +456,6 @@ def doctor(
             raise typer.Exit(1)
 
 
-@app.command()
 def repair(
     force: Annotated[
         bool,
@@ -491,7 +487,6 @@ def repair(
                 )
 
 
-@app.command()
 def audit(
     tool: Annotated[str | None, typer.Option("--tool", help="Filter by tool name.")] = None,
     status: Annotated[
@@ -551,7 +546,6 @@ def audit(
         raise typer.BadParameter("--format must be one of: table, json, csv")
 
 
-@app.command()
 def migrate(
     dsn: Annotated[str | None, typer.Option("--dsn", help="Postgres DSN to migrate.")] = None,
     dry_run: Annotated[
@@ -599,6 +593,78 @@ def migrate(
             f"Migration complete: surfaces={result.get('surfaces', len(SURFACES))} "
             f"audit_log={result.get('audit_log', True)}"
         )
+
+
+_CLI_EXCLUDED = frozenset({"init", "mcp", "serve", "migrate-config"})
+_CLI_TOOL_TO_COMMAND: Mapping[str, str] = {
+    "ilma_status": "status",
+    "ilma_search": "search",
+    "ilma_remember": "remember",
+    "ilma_forget": "forget",
+    "ilma_doctor": "doctor",
+    "ilma_repair": "repair",
+    "ilma_audit": "audit",
+    "ilma_migrate": "migrate",
+}
+
+
+def _cli_tool_specs() -> dict[str, dict[str, Any]]:
+    """Return service-derived specs for tools that have CLI command equivalents."""
+
+    specs = dict(tools_dict(IlmaMcpService))
+    if "ilma_audit" not in specs:
+        audit_method = IlmaMcpService.ilma_audit
+        specs["ilma_audit"] = {
+            "description": method_description(audit_method),
+            "input_model": method_to_pydantic_model(audit_method),
+            "handler": None,
+        }
+    return {name: specs[name] for name in _CLI_TOOL_TO_COMMAND if name in specs}
+
+
+def _make_auto_command(command_name: str, implementation: Any) -> Any:
+    """Wrap an implementation function in an auto-registered Typer callback."""
+
+    def command(**kwargs: Any) -> None:
+        return implementation(**kwargs)
+
+    command.__name__ = command_name.replace("-", "_")
+    command.__doc__ = implementation.__doc__
+    type_hints = get_type_hints(implementation, include_extras=True)
+    signature = inspect.signature(implementation)
+    command.__signature__ = signature.replace(  # type: ignore[attr-defined]
+        parameters=[
+            parameter.replace(annotation=type_hints.get(name, parameter.annotation))
+            for name, parameter in signature.parameters.items()
+        ]
+    )
+    command.__annotations__ = type_hints
+    command.__ilma_auto_registered__ = True  # type: ignore[attr-defined]
+    return command
+
+
+def _register_service_commands(typer_app: typer.Typer) -> None:
+    """Register CLI commands for service methods by walking ``tools_dict()``."""
+
+    implementations = {
+        "ilma_status": status,
+        "ilma_search": search,
+        "ilma_remember": remember,
+        "ilma_forget": forget,
+        "ilma_doctor": doctor,
+        "ilma_repair": repair,
+        "ilma_audit": audit,
+        "ilma_migrate": migrate,
+    }
+    for tool_name in _cli_tool_specs():
+        command_name = _CLI_TOOL_TO_COMMAND[tool_name]
+        if command_name in _CLI_EXCLUDED:
+            continue
+        implementation = implementations[tool_name]
+        typer_app.command(command_name)(_make_auto_command(command_name, implementation))
+
+
+_register_service_commands(app)
 
 
 @app.command("migrate-config")
