@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 import os
 import re
+import textwrap
 import time
 import traceback
 from collections.abc import Callable, Mapping
@@ -162,19 +164,6 @@ def _parse_sphinx_params(doc: str) -> dict[str, str]:
 
 
 TOOL_COUNT = 30
-WRITE_TOOLS: Mapping[str, tuple[str, str]] = {
-    "ilma_remember": ("memory", "remember"),
-    "ilma_forget": ("memory", "forget"),
-    "ilma_wiki_create": ("wiki", "create"),
-    "ilma_wiki_update": ("wiki", "update"),
-    "ilma_kanban_create": ("kanban", "create"),
-    "ilma_kanban_update": ("kanban", "update"),
-    "ilma_kanban_complete": ("kanban", "complete"),
-    "ilma_metrics_record": ("metrics", "record"),
-    "ilma_obs_log": ("observability", "log"),
-    "ilma_migrate": ("maintenance", "migrate"),
-    "ilma_repair": ("maintenance", "repair"),
-}
 
 SURFACE_TABLES: Mapping[str, tuple[str, ...]] = {
     "memory": ("memories", "memory_chunks"),
@@ -1371,4 +1360,129 @@ class IlmaService:
                 (limit, offset_value),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+
+_READ_TOOL_ACTIONS = frozenset(
+    {
+        "audit",
+        "doctor",
+        "get",
+        "health",
+        "list",
+        "query",
+        "recent",
+        "search",
+        "status",
+    }
+)
+_MAINTENANCE_ACTIONS = frozenset({"migrate", "repair"})
+
+
+def _derive_write_tools(service_cls: type[Any] = IlmaService) -> dict[str, tuple[str, str]]:
+    """Derive audit write-tool metadata by inspecting IlmaService methods.
+
+    A write tool is a public ``ilma_*`` method that dispatches through
+    ``self.call(...)`` and whose tool-name action is not read-only. The
+    surface/action pair is inferred from the tool name and, when available,
+    from the repository surface used in the method body.
+    """
+
+    discovered: list[tuple[int, str, tuple[str, str]]] = []
+    for index, (name, member) in enumerate(vars(service_cls).items()):
+        if name in EXCLUDED_TOOL_NAMES or not name.startswith(TOOLS_ATTR_PREFIX):
+            continue
+        if not inspect.isfunction(member) or not _method_calls_self_call(member):
+            continue
+        surface_action = _infer_write_surface_action(name, member)
+        if surface_action is None:
+            continue
+        discovered.append((index, name, surface_action))
+    discovered.sort(key=_write_tool_order_key)
+    return {name: surface_action for _, name, surface_action in discovered}
+
+
+def _write_tool_order_key(item: tuple[int, str, tuple[str, str]]) -> tuple[int, str]:
+    index, _, (surface, action) = item
+    surface_order = {surface_name: order for order, surface_name in enumerate(SURFACE_TABLES)}
+    surface_order["maintenance"] = len(surface_order)
+    order = surface_order.get(surface, len(surface_order) + 1)
+    secondary = action if surface == "maintenance" else f"{index:06d}"
+    return order, secondary
+
+
+def _method_calls_self_call(method: Callable[..., Any]) -> bool:
+    tree = _method_ast(method)
+    if tree is None:
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "call"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        for node in ast.walk(tree)
+    )
+
+
+def _infer_write_surface_action(
+    tool_name: str, method: Callable[..., Any]
+) -> tuple[str, str] | None:
+    suffix = tool_name.removeprefix(TOOLS_ATTR_PREFIX)
+    parts = suffix.split("_")
+    if not suffix or parts[0] in _READ_TOOL_ACTIONS:
+        return None
+
+    if len(parts) == 1:
+        action = parts[0]
+        if action in _READ_TOOL_ACTIONS:
+            return None
+        surface = _single_surface_from_method(method) or _surface_for_single_action(action)
+        if surface is None:
+            return None
+        return surface, action
+
+    action = "_".join(parts[1:])
+    if action in _READ_TOOL_ACTIONS:
+        return None
+    surface = _single_surface_from_method(method) or parts[0]
+    return surface, action
+
+
+def _single_surface_from_method(method: Callable[..., Any]) -> str | None:
+    tree = _method_ast(method)
+    if tree is None:
+        return None
+    surfaces = {
+        node.func.value.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "self"
+        and node.func.value.attr in SURFACE_TABLES
+    }
+    if len(surfaces) == 1:
+        return next(iter(surfaces))
+    return None
+
+
+def _surface_for_single_action(action: str) -> str | None:
+    if action in _MAINTENANCE_ACTIONS:
+        return "maintenance"
+    return None
+
+
+def _method_ast(method: Callable[..., Any]) -> ast.Module | None:
+    try:
+        source = inspect.getsource(method)
+    except (OSError, TypeError):
+        return None
+    try:
+        return ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return None
+
+
+WRITE_TOOLS: Mapping[str, tuple[str, str]] = _derive_write_tools()
 

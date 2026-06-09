@@ -5,7 +5,14 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from ilma.service import method_description, method_to_pydantic_model, tools_dict
+from ilma.service import (
+    WRITE_TOOLS,
+    IlmaService,
+    _derive_write_tools,
+    method_description,
+    method_to_pydantic_model,
+    tools_dict,
+)
 
 
 def test_method_to_pydantic_model_builds_fields_from_signature() -> None:
@@ -115,6 +122,42 @@ def test_method_description_uses_first_docstring_line_or_method_name() -> None:
 
     assert method_description(documented) == "First line."
     assert method_description(undocumented) == "ilma: undocumented"
+
+
+def test_write_tools_set_unchanged() -> None:
+    previous_hand_maintained_mapping = {
+        "ilma_remember": ("memory", "remember"),
+        "ilma_forget": ("memory", "forget"),
+        "ilma_wiki_create": ("wiki", "create"),
+        "ilma_wiki_update": ("wiki", "update"),
+        "ilma_kanban_create": ("kanban", "create"),
+        "ilma_kanban_update": ("kanban", "update"),
+        "ilma_kanban_complete": ("kanban", "complete"),
+        "ilma_metrics_record": ("metrics", "record"),
+        "ilma_obs_log": ("observability", "log"),
+        "ilma_migrate": ("maintenance", "migrate"),
+        "ilma_repair": ("maintenance", "repair"),
+    }
+
+    assert dict(WRITE_TOOLS) == previous_hand_maintained_mapping
+
+
+def test_write_tools_derive_from_class() -> None:
+    assert _derive_write_tools(IlmaService) == dict(WRITE_TOOLS)
+
+
+def test_adding_a_new_write_method_updates_dict_without_manual_edit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def ilma_dummy_write(self: Any) -> dict[str, Any]:
+        return self.call("ilma_dummy_write", lambda: {"ok": True}, {})
+
+    monkeypatch.setattr(IlmaService, "ilma_dummy_write", ilma_dummy_write, raising=False)
+
+    derived = _derive_write_tools()
+
+    assert derived["ilma_dummy_write"] == ("dummy", "write")
+    assert "ilma_dummy_write" not in WRITE_TOOLS
 
 
 class MiniService:
