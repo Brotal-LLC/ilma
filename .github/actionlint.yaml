@@ -1,15 +1,22 @@
-# ilma's actionlint config.
-#
-# The 'rogue' label pins to a specific self-hosted runner host. The sv
-# workflow uses the same label scheme (see skb50bd/sv/.github/actionlint.yaml)
-# because the Brotal-LLC self-hosted runner is org-scoped and shared
-# between sv and ilma.
-#
-# Add suppressions here only for known false-positives, each with a
-# one-line rationale comment. Do not blanket-disable lints.
 self-hosted-runner:
+  # Labels attached to all self-hosted runners on Brotal-LLC. As of
+  # 2026-06-10 there are 5 org-scoped runners on Brotal-LLC:
+  #
+  #   On rogue (10.49.10.10, 4c/7GB/80GB):
+  #     - rogue-runner-1
+  #     - rogue-runner-2
+  #
+  #   On inframework (10.49.10.1, 16c/61GB/401GB), in-Docker-dind
+  #   (3 GB build cap, 1 GB agent cap per stack):
+  #     - inframework-runner-1
+  #     - inframework-runner-2
+  #     - inframework-runner-3
+  #
+  # All 5 runners have the same label set: [self-hosted, linux, x64].
+  # There are no app-specific or host-specific labels — any workflow
+  # in Brotal-LLC/* can target them with
+  #   runs-on: [self-hosted, linux, x64]
   labels:
     - self-hosted
     - linux
     - x64
-    - rogue
