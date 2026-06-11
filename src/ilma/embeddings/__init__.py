@@ -128,9 +128,9 @@ class EmbedderRegistry:
             dim = config.vectors.dim
             model = config.vectors.openai_model
         elif provider == "http":
-            base_url = config.vectors.base_url
+            base_url = config.vectors.base_url or ""
             dim = config.vectors.dim
-            model = config.vectors.openai_model
+            model = config.vectors.openai_model or ""
             if not base_url or not model:
                 msg = "http embedder requires ILMA_EMBED_BASE_URL and ILMA_EMBED_MODEL"
                 raise ValueError(msg)

@@ -12,11 +12,9 @@ self-hosted-runner:
   #     - inframework-runner-2
   #     - inframework-runner-3
   #
-  # All 5 runners have the same label set: [self-hosted, linux, x64].
+  # All 5 runners have the same label set: [self-hosted].
   # There are no app-specific or host-specific labels — any workflow
   # in Brotal-LLC/* can target them with
-  #   runs-on: [self-hosted, linux, x64]
+  #   runs-on: self-hosted
   labels:
     - self-hosted
-    - linux
-    - x64
