@@ -12,7 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -37,7 +37,7 @@ _DSN_ENV_VARS = ("ILMA_DSN", "PG_MEM_DB_CONN_STR", "HERMES_PG_CONN_STR")
 _NON_PRIMARY_CONTEXTS = {"cron", "flush"}
 
 
-class IlmaMemoryProvider(MemoryProvider):
+class IlmaMemoryProvider(MemoryProvider):  # type: ignore[misc]
     """Hermes MemoryProvider backed by ilma's Postgres + vector service."""
 
     def __init__(self) -> None:
@@ -198,7 +198,7 @@ def _build_service(*, dsn: str, hermes_home: str | None = None) -> IlmaService:
     if "hermes_home" in signature.parameters:
         kwargs["hermes_home"] = hermes_home
     if kwargs:
-        return IlmaService(**kwargs)  # type: ignore[arg-type]
+        return IlmaService(**kwargs)
 
     if not dsn:
         msg = "set ILMA_DSN, PG_MEM_DB_CONN_STR, HERMES_PG_CONN_STR, or ilma config.yaml dsn"
@@ -212,7 +212,7 @@ def _build_service(*, dsn: str, hermes_home: str | None = None) -> IlmaService:
 def _service_tools(service: Any) -> dict[str, dict[str, Any]]:
     service_tools = getattr(service, "tools_dict", None)
     if callable(service_tools):
-        return service_tools()
+        return cast(dict[str, dict[str, Any]], service_tools())
     return tools_dict(service)
 
 
@@ -231,7 +231,7 @@ def _model_json_schema(input_model: Any) -> dict[str, Any]:
     schema.setdefault("type", "object")
     schema.setdefault("properties", {})
     schema.setdefault("required", [])
-    return schema
+    return cast(dict[str, Any], schema)
 
 
 def _resolve_dsn(hermes_home: str | None = None) -> str:
@@ -266,7 +266,7 @@ def _dsn_from_config(path: Path) -> str:
         return ""
     if not isinstance(data, dict):
         return ""
-    candidates = (
+    candidates: tuple[Any | None, ...] = (
         data.get("dsn"),
         data.get("database_url"),
         data.get("postgres_dsn"),

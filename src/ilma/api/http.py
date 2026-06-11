@@ -249,7 +249,7 @@ def _body_model_for_route(
     }
     if not body_fields:
         return None
-    return create_model(f"{tool_name}_HttpBody", **body_fields)
+    return cast(type[BaseModel], create_model(f"{tool_name}_HttpBody", **body_fields))  # type: ignore[call-overload]
 
 
 def _route_signature(
@@ -319,7 +319,7 @@ def _make_service_route_handler(
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
         handler = getattr(service, tool_name)
-        return handler(**model.model_dump())
+        return cast(dict[str, Any], handler(**model.model_dump()))
 
     service_route.__name__ = f"http_{tool_name}"
     cast(Any, service_route).__signature__ = _route_signature(

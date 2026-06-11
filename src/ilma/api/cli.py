@@ -644,7 +644,8 @@ def _make_auto_command(command_name: str, implementation: Any) -> Any:
     """Wrap an implementation function in an auto-registered Typer callback."""
 
     def command(**kwargs: Any) -> None:
-        return implementation(**kwargs)
+        implementation(**kwargs)
+        return None
 
     command.__name__ = command_name.replace("-", "_")
     command.__doc__ = implementation.__doc__

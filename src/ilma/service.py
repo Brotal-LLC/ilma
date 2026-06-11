@@ -56,7 +56,7 @@ def method_to_pydantic_model(method: Callable[..., Any]) -> type[BaseModel]:
         )
     model = create_model(f"{method.__name__}_Args", **fields)
     model.__doc__ = method_description(method)
-    return model
+    return cast(type[BaseModel], model)
 
 
 def tools_dict(service: Any) -> dict[str, dict[str, Any]]:

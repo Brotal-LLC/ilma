@@ -45,14 +45,14 @@ def _passthrough_schema(name: str, description: str) -> dict[str, Any]:
     }
 
 
-def _docstring_or_default(fn: Callable, name: str) -> str:
+def _docstring_or_default(fn: Callable[..., Any], name: str) -> str:
     doc = inspect.getdoc(fn)
     if doc:
         return doc.strip().split("\n", 1)[0]
     return f"ilma tool: {name}"
 
 
-def _bind(fn: Callable) -> Callable:
+def _bind(fn: Callable[..., Any]) -> Callable[..., Any]:
     def _handler(args: dict[str, Any], **_: Any) -> Any:
         return fn(**args)
 
@@ -86,7 +86,7 @@ def _try_build_service() -> Any | None:
         return None
 
 
-def register(ctx) -> None:
+def register(ctx: Any) -> None:
     """Hermes Agent plugin entry point."""
     provider = _read_provider()
     service = _try_build_service() if provider in (PROVIDER_ILMA, PROVIDER_AUTO) else None
@@ -145,9 +145,9 @@ def _register_ilma_tools(ctx: Any, service: Any | None) -> None:
         )
 
 
-def _collect_tool_methods(service: Any) -> dict[str, Callable]:
+def _collect_tool_methods(service: Any) -> dict[str, Callable[..., Any]]:
     """Collect public ilma_* methods on the service as tool candidates."""
-    methods: dict[str, Callable] = {}
+    methods: dict[str, Callable[..., Any]] = {}
     for name in dir(service):
         if name.startswith("_") or not name.startswith("ilma_"):
             continue

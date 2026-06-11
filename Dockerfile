@@ -36,7 +36,7 @@ RUN groupadd --gid 1000 ilma \
     && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin ilma
 
 COPY --from=builder /wheels /wheels
-RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels "ilma[http,mcp]" \
+RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels "ilma-agent[http,mcp]" \
     && rm -rf /wheels
 
 USER 1000:1000
