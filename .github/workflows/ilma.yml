@@ -266,7 +266,6 @@ jobs:
 # local environment).
 # ==============================================================================
   release:
-    needs: [build]
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.publish_pypi)
