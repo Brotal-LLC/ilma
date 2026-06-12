@@ -9,9 +9,9 @@
 #     (PyPI + GHCR image) and the CI flow must NOT mutate the user's local
 #     installation. Deploy-to-ilma.aamar.cloud is a local manual step via
 #     ~/infra/scripts/deploy-ilma.sh, not a CI/CD concern.
-#   - PyPI publish. No PYPI_API_TOKEN secret is configured. Adding a job that
-#     fails on every release due to a missing secret is noise; re-add when the
-#     user provisions a PyPI trusted publisher.
+#   - PyPI publish is gated behind workflow_dispatch `publish_pypi=true` or
+#     `v*` tag pushes via Trusted Publishing OIDC. No long-lived PyPI token is
+#     required; PyPI must have a pending trusted publisher for this workflow.
 #   - Coverage gate. No coverage tooling is configured; re-add when
 #     pytest-cov is in pyproject.toml [dependency-groups.dev].
 #   - E2E job. The unit tests + the post-deploy smoke test (when the user runs
@@ -49,7 +49,11 @@ on:
   workflow_dispatch:
     inputs:
       publish_pypi:
-        description: "Also publish to PyPI (requires PYPI_API_TOKEN secret)"
+        description: "Publish the built wheel/sdist to PyPI"
+        type: boolean
+        default: false
+      push_docker:
+        description: "Build and push the GHCR image"
         type: boolean
         default: false
   schedule:
@@ -62,11 +66,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  # Suppresses "Node 16/20 deprecated" warnings emitted by JS-based actions
-  # (e.g. actions/checkout). Matches sv/.github/workflows/sv.yml:37.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 # ==============================================================================
 # PHASE 1 — Lint (PR + push, ~30s)
 # Cheap, parallel checks. Fails fast on syntax / formatting.
@@ -74,30 +73,26 @@ env:
 jobs:
   lint:
     if: github.event_name != 'schedule'
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, Linux, X64, inframework]
     steps:
       - uses: actions/checkout@v6
 
       - name: actionlint
-        uses: reviewdog/action-actionlint@v1
-        with:
-          fail_level: error
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.7 /tmp
+          /tmp/actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml
 
       - name: hadolint
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: Dockerfile
+        run: |
+          curl -sSfL https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64 -o /tmp/hadolint
+          chmod +x /tmp/hadolint
+          /tmp/hadolint -c .hadolint.yaml Dockerfile
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v8.2.0
         with:
           version: "latest"
           enable-cache: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
 
       - name: Install
         run: uv sync --python 3.11 --extra http --extra mcp --group dev
@@ -115,47 +110,41 @@ jobs:
 
 # ==============================================================================
 # PHASE 2 — Test (PR + push, ~2-3 min, parallel with lint)
-# Matrix 3.11 + 3.12 against a throwaway pgvector service. The runner's
-# ephemeral venv is independent of the user's local install.
+# Matrix 3.11 + 3.12 against Testcontainers-managed pgvector.
 # ==============================================================================
   test:
     if: github.event_name != 'schedule'
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, Linux, X64, inframework]
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: ilma
-          POSTGRES_PASSWORD: ilma
-          POSTGRES_DB: ilma_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
     steps:
       - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8.2.0
         with:
           version: "latest"
           enable-cache: true
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ matrix.python-version }}
+      - name: Install Python
+        run: uv python install "${{ matrix.python-version }}"
       - name: Install
         run: uv sync --python "${{ matrix.python-version }}" --extra http --extra mcp --group dev
         env:
           UV_LINK_MODE: copy
+      - name: Clean Testcontainers leftovers
+        run: |
+          docker ps -aq --filter "name=testcontainers-" | xargs -r docker rm -f
+      - name: Configure Testcontainers Docker-in-Docker host
+        if: contains(runner.name, 'inframework-runner')
+        run: echo "TESTCONTAINERS_HOST_OVERRIDE=dind" >> "$GITHUB_ENV"
       - name: Test
         env:
-          ILMA_DSN: postgresql://ilma:***@localhost:5432/ilma_test
+          TESTCONTAINERS_RYUK_DISABLED: "true"
         run: uv run pytest tests/ -v --tb=short
+      - name: Clean Testcontainers leftovers
+        if: always()
+        run: |
+          docker ps -aq --filter "name=testcontainers-" | xargs -r docker rm -f
 
 # ==============================================================================
 # PHASE 3 — Security (PR + push, parallel with test, ~1 min)
@@ -164,31 +153,28 @@ jobs:
 # ==============================================================================
   security:
     if: github.event_name != 'schedule'
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, Linux, X64, inframework]
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: TruffleHog secret scan
-        uses: trufflesecurity/trufflehog@main
-        with:
-          # Scan the entire repo on every event. The action's built-in
-          # `base`/`head` derivation errors on single-commit push events
-          # with "BASE and HEAD commits are the same"; a full scan is
-          # slightly slower but never fails spuriously. Verified-secrets
-          # only — no false-positive noise in the build log.
-          path: ./
-          extra_args: --debug --only-verified
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /tmp
+          /tmp/trufflehog git file://"$GITHUB_WORKSPACE" --fail --no-update --github-actions --only-verified
 
 # ==============================================================================
-# PHASE 4 — Tag (push to main only, ~5s)
+# PHASE 4 — Tag (push to main/tag or manual full-CI dispatch, ~5s)
 # Compute the short commit SHA so downstream build jobs tag the GHCR image
 # consistently. Mirrors sv.yml:365-384.
-# ==============================================================================
+# =============================================================================
   tag:
     needs: [lint, test, security]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, linux, x64]
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.push_docker)
+    runs-on: [self-hosted, Linux, X64, inframework]
     outputs:
       build_tag: ${{ steps.sha.outputs.value }}
     steps:
@@ -200,20 +186,24 @@ jobs:
           echo "Build tag: ${SHORT}"
 
 # ==============================================================================
-# PHASE 5 — Build & publish image (push to main only, gated on tag)
-# Single image (ghcr.io/<owner>/ilma) tagged with the short SHA + `main` +
-# `latest`. Layer-cached via GHA cache.
-# ==============================================================================
+# PHASE 5 — Build & publish image (push to main/tag or manual full-CI dispatch, gated on tag)
+# Single image (ghcr.io/brotal-llc/ilma) tagged with the short SHA. Main pushes
+# also get `main` + `latest`; tag pushes get the tag name; manual dispatches get
+# `workflow`. Layer-cached via GHA cache.
+# =============================================================================
   build:
     needs: [tag]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, linux, x64]
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.push_docker)
+    runs-on: [self-hosted, Linux, X64, inframework]
     permissions:
       contents: read
       packages: write
     env:
       REGISTRY: ghcr.io
-      IMAGE_NAME: ${{ github.repository_owner }}/ilma
+      IMAGE_NAME: brotal-llc/ilma
     steps:
       - uses: actions/checkout@v6
 
@@ -233,10 +223,11 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=sha,prefix=
-            type=sha
-            type=raw,value=main,enable={{is_default_branch}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.tag.outputs.build_tag }}
+            type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:workflow,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -250,9 +241,9 @@ jobs:
           provenance: false
 
 # ==============================================================================
-# PHASE 6 — Release (push `v*` tag only, gated on build)
-# Auto-generates GitHub release notes from merged PRs and publishes the
-# package to PyPI via Trusted Publishing (OIDC, no long-lived secret).
+# PHASE 6 — Release / PyPI publish (push `v*` tag or manual full-CI dispatch, gated on build)
+# Publishes the package to PyPI via Trusted Publishing (OIDC, no long-lived
+# secret). GitHub release creation stays tag-only.
 #
 # PyPI Trusted Publishing setup (one-time, by hand):
 #   1. https://pypi.org/manage/account/publishing/ → "Add pending publisher"
@@ -276,13 +267,16 @@ jobs:
 # ==============================================================================
   release:
     needs: [build]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, linux, x64]
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_pypi)
+    runs-on: [self-hosted, Linux, X64, inframework]
     permissions:
       # contents: write — gh release create
       # id-token: write — PyPI Trusted Publishing OIDC handshake
       contents: write
       id-token: write
+    environment: production
     steps:
       - uses: actions/checkout@v6
         with:
@@ -303,8 +297,11 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: /github/workspace/dist
 
       - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}

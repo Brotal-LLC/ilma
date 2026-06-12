@@ -180,6 +180,7 @@ def migrate_hermes_v2_schema(
         }
 
     emit("detected hermes-memory v2 schema")
+    surfaces: dict[str, SurfaceStats]
     if dry_run:
         with Connection.connect(dsn) as conn:
             surfaces = _dry_run_counts(conn)
@@ -198,7 +199,7 @@ def migrate_hermes_v2_schema(
     with Connection.connect(dsn) as conn:
         conn.autocommit = False
         try:
-            surfaces: dict[str, SurfaceStats] = {}
+            surfaces = {}
             memory_id_map: dict[int, int] = {}
             wiki_id_map: dict[int, int] = {}
             kanban_id_map: dict[str, int] = {}

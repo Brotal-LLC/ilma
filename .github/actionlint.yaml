@@ -12,11 +12,15 @@ self-hosted-runner:
   #     - inframework-runner-2
   #     - inframework-runner-3
   #
-  # All 5 runners have the same label set: [self-hosted, linux, x64].
-  # There are no app-specific or host-specific labels — any workflow
-  # in Brotal-LLC/* can target them with
-  #   runs-on: [self-hosted, linux, x64]
+  #   All 5 runners have the default labels [self-hosted, Linux, X64].
+  #   The three inframework runners also carry the custom label [inframework]
+  #   so Docker-heavy publish jobs avoid the host-native rogue runners.
+  #   Any workflow in Brotal-LLC/* can target all runners with
+  #     runs-on: self-hosted
+  #   or target only the in-Docker-dind pool with
+  #     runs-on: [self-hosted, Linux, X64, inframework]
   labels:
     - self-hosted
-    - linux
-    - x64
+    - Linux
+    - X64
+    - inframework
