@@ -161,6 +161,12 @@ class InMemoryAuditLogger:
 _SERVICE: IlmaMcpService | None = None
 
 
+def get_cached_service() -> IlmaMcpService | None:
+    """Return the process service without building one from environment."""
+
+    return _SERVICE
+
+
 def get_service() -> IlmaMcpService:
     global _SERVICE
     if _SERVICE is None:
