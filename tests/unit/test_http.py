@@ -295,6 +295,29 @@ def test_health_status_and_openapi(client: TestClient) -> None:
         assert path in paths
 
 
+def test_health_does_not_require_configured_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ILMA_DSN", raising=False)
+    monkeypatch.delenv("PG_MEM_DB_CONN_STR", raising=False)
+    monkeypatch.delenv("HERMES_PG_CONN_STR", raising=False)
+    set_service(None)
+    app = create_app()
+    with TestClient(app) as test_client:
+        health = test_client.get("/health")
+        assert health.status_code == 200
+        payload = health.json()
+        assert payload["ok"] is True
+        assert payload["status"] == "alive"
+        assert payload["backend"]["configured"] is False
+        assert payload["checks"]["http"]["ok"] is True
+
+        spec = test_client.get("/openapi.json")
+        assert spec.status_code == 200
+        assert "/health" in spec.json()["paths"]
+    set_service(None)
+
+
 def test_memory_routes(client: TestClient) -> None:
     remembered = assert_ok(
         client.post(

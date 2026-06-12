@@ -20,7 +20,7 @@ from ilma.api.hardening import (
     log_observation,
     pool_size_from_backend,
 )
-from ilma.api.mcp import IlmaMcpService, get_service, set_service
+from ilma.api.mcp import IlmaMcpService, get_cached_service, get_service, set_service
 from ilma.config import IlmaConfig
 from ilma.service import tools_dict
 
@@ -202,6 +202,26 @@ def _health_payload(service: IlmaMcpService) -> dict[str, Any]:
     return {
         "ok": bool(status.get("ok") and backend.get("ok", True)),
         "backend": backend,
+    }
+
+
+def _unconfigured_health_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "status": "alive",
+        "backend": {
+            "ok": False,
+            "configured": False,
+            "skipped": "service not configured; set ILMA_DSN or PG_MEM_DB_CONN_STR",
+        },
+        "checks": {
+            "http": {"ok": True, "message": "HTTP process is alive"},
+            "service": {
+                "ok": False,
+                "configured": False,
+                "skipped": "service not configured; set ILMA_DSN or PG_MEM_DB_CONN_STR",
+            },
+        },
     }
 
 
@@ -426,10 +446,13 @@ def create_app(service: IlmaMcpService | None = None) -> FastAPI:
             )
 
     @app.get("/health", tags=["system"])
-    def health(service: IlmaMcpService = SERVICE_DEPENDENCY) -> dict[str, Any]:
-        """Return structured health checks for Postgres, pgvector, and embedders."""
+    def health() -> dict[str, Any]:
+        """Return liveness without forcing lazy service construction from env."""
 
-        return _health_payload(service)
+        service = get_cached_service()
+        if service is not None:
+            return _health_payload(service)
+        return _unconfigured_health_payload()
 
     @app.get("/metrics", tags=["system"], response_class=PlainTextResponse)
     def scrape_metrics(service: IlmaMcpService = SERVICE_DEPENDENCY) -> str:
