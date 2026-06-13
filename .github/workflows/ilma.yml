@@ -300,16 +300,17 @@ jobs:
         with:
           script: |
             const token = await core.getIDToken('pypi')
+            const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'))
+            core.info('PyPI OIDC claims:')
+            core.info(JSON.stringify(payload, null, 2))
             core.setOutput('token', token)
 
       - name: Publish to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ steps.pypi-token.outputs.token }}
-          TWINE_NON_INTERACTIVE: "1"
-        run: |
-          python -m pip install --upgrade twine
-          python -m twine upload --repository-url https://upload.pypi.org/legacy/ dist/*
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          password: ${{ steps.pypi-token.outputs.token }}
+          attestations: false
 
       - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
