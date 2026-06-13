@@ -318,7 +318,7 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: ${{ steps.dist.outputs.dist_dir }}
+          packages-dir: dist
           password: ${{ steps.pypi-token.outputs.token }}
           attestations: false
 
