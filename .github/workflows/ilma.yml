@@ -292,10 +292,10 @@ jobs:
           python -m pip install build
 
       - name: Build sdist + wheel
-        run: python -m build --sdist --wheel
-
-      - name: Flatten distributions for pypa publish action
-        run: cp dist/* .
+        run: |
+          python -m build --sdist --wheel
+          cp dist/* .
+          cp dist/* "$(dirname "$PWD")/"
 
       - name: Mint PyPI OIDC token
         id: pypi-token
