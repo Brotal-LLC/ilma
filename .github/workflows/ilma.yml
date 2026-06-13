@@ -302,6 +302,8 @@ jobs:
           dist_dir="$(find "$GITHUB_WORKSPACE" -maxdepth 4 -type d -name dist -print -quit)"
           echo "dist_dir=$dist_dir"
           find "$dist_dir" -maxdepth 1 -type f -print
+          mkdir -p /github/workspace/dist
+          cp "$dist_dir"/* /github/workspace/dist/
           echo "dist_dir=$dist_dir" >> "$GITHUB_OUTPUT"
 
       - name: Mint PyPI OIDC token
