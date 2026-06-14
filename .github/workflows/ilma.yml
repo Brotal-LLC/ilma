@@ -303,17 +303,22 @@ jobs:
 
           # Exchange GitHub OIDC token for a short-lived PyPI API token.
           id_token=$(python3 -c '
-          import json, os, urllib.request
-          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          import json, os, urllib.request, urllib.error
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=pypi"
           token = os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
           req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-          with urllib.request.urlopen(req) as resp:
-              data = json.load(resp)
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  data = json.load(resp)
+          except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8", "replace")
+              print(f"GitHub OIDC token request failed: {e.code} {body}", file=__import__("sys").stderr)
+              raise
           print(data["value"])
           ')
 
           pypi_token=$(python3 -c '
-          import json, os, urllib.request
+          import json, os, urllib.request, urllib.error
           id_token = """'"$id_token"'"""
           payload = json.dumps({"token": id_token}).encode()
           req = urllib.request.Request(
@@ -322,8 +327,13 @@ jobs:
               headers={"Content-Type": "application/json"},
               method="POST",
           )
-          with urllib.request.urlopen(req) as resp:
-              data = json.load(resp)
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  data = json.load(resp)
+          except urllib.error.HTTPError as e:
+              body = e.read().decode("utf-8", "replace")
+              print(f"PyPI mint-token failed: {e.code} {body}", file=__import__("sys").stderr)
+              raise
           print(data["token"])
           ')
 
