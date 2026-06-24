@@ -65,7 +65,7 @@ ilma = "ilma.api.cli:main"
 ilma-mcp = "ilma.api.mcp:main"
 
 [project.entry-points."hermes_agent.plugins"]
-ilma = "ilma.adapters.hermes.register:register"
+ilma = "ilma.adapters.hermes"
 ilma_memory = "ilma.adapters.hermes.memory_provider:IlmaMemoryProvider"
 
 [project.entry-points."ilma.backends"]

@@ -95,7 +95,9 @@ def test_register_with_ilma_provider_binds_tools_and_override(
     ctx = FakeCtx()
 
     # Patch service construction so we don't need a real DSN.
-    import ilma.adapters.hermes.register as reg
+    import importlib
+
+    reg = importlib.import_module("ilma.adapters.hermes.register")
 
     original_try_build = reg._try_build_service
     reg._try_build_service = lambda: service
@@ -131,7 +133,9 @@ def test_memory_override_add_search_remove(monkeypatch: pytest.MonkeyPatch) -> N
     service = FakeService(FakeMemoryRepo())
     ctx = FakeCtx()
 
-    import ilma.adapters.hermes.register as reg
+    import importlib
+
+    reg = importlib.import_module("ilma.adapters.hermes.register")
 
     original_try_build = reg._try_build_service
     reg._try_build_service = lambda: service
@@ -161,7 +165,9 @@ def test_pre_tool_call_returns_memory_block(monkeypatch: pytest.MonkeyPatch) -> 
     service.memory.remember("User prefers dark mode", tags=["user"], category="identity")
     ctx = FakeCtx()
 
-    import ilma.adapters.hermes.register as reg
+    import importlib
+
+    reg = importlib.import_module("ilma.adapters.hermes.register")
 
     original_try_build = reg._try_build_service
     reg._try_build_service = lambda: service
