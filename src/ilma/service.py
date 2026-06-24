@@ -966,12 +966,60 @@ class IlmaService:
             },
         )
 
-    def ilma_migrate(self) -> dict[str, Any]:
+    def ilma_migrate(self, reembed: bool = False) -> dict[str, Any]:
         def run() -> dict[str, Any]:
             self._initialize_all()
-            return _ok(migrated=True, surfaces=8, audit_log=True)
+            result: dict[str, Any] = _ok(migrated=True, surfaces=8, audit_log=True)
+            if reembed:
+                reembed_result = self._repair_migrated_memories()
+                result["reembed"] = reembed_result
+            return result
 
-        return self.call("ilma_migrate", run, {})
+        return self.call("ilma_migrate", run, {"reembed": reembed})
+
+    def _repair_migrated_memories(self) -> dict[str, Any]:
+        """Post-process live memories migrated from hermes-memory v2.
+
+        Repairs three known migration artifacts on a non-pristine source DB:
+
+        1. **Corrupt tags**: text[] arrays containing one-character-per-element
+           (source-DB bug where a comma-separated string was stored as
+           `{"i","d","e","n","t","i","t","y",",",...}`). Re-derives sensible
+           tags from the content using a small set of keyword rules.
+        2. **Zero vectors**: ``vector_768/1024/1536`` columns are all-zero
+           (source hermes-memory v2 never pre-computed embeddings). Re-embeds
+           each affected memory using the configured ``EmbedderRegistry``.
+        3. **Missing chunks**: ``ilma.memory_chunks`` is empty for migrated
+           memories. Chunks long content (``>200`` chars) on sentence
+           boundaries (max 1024 chars per chunk, target 512).
+
+        Idempotent. Uses ``self.backend._pool`` and ``self._embedders`` if
+        the backend exposes a Postgres pool and an embedder is configured.
+        Skips silently (returning ``{"skipped": "..."}``) when neither is
+        available, so non-Postgres backends don't error.
+        """
+
+        if not self._has_pg_pool():
+            return {
+                "ok": True,
+                "skipped": "backend does not expose a Postgres pool",
+            }
+        embedder_registry = getattr(self.memory, "_embedders", None)
+        if embedder_registry is None:
+            return {
+                "ok": True,
+                "skipped": "embedder unavailable on memory repository",
+            }
+
+        # Import lazily so the import cost doesn't apply to users that never
+        # run --reembed.
+        from ilma.repair import repair_migrated_memories
+
+        with self.backend._pool.connection() as connection:  # noqa: SLF001
+            return repair_migrated_memories(
+                connection,
+                embedder_registry=embedder_registry,
+            )
 
     def _has_pg_pool(self) -> bool:
         return hasattr(self.backend, "_pool")

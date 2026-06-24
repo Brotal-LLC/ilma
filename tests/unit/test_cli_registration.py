@@ -102,6 +102,7 @@ def test_expected_service_commands_are_auto_registered() -> None:
         "recall",
         "remember",
         "forget",
+        "list",
         "doctor",
         "repair",
         "audit",

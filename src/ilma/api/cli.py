@@ -447,6 +447,111 @@ def forget(
         typer.echo(f"Memory {memory_id} was not found or was already deleted.")
 
 
+def list_memories(
+    limit: Annotated[
+        int,
+        typer.Option(
+            "--limit",
+            "-n",
+            help="Maximum number of memories to return (1-1000).",
+        ),
+    ] = 50,
+    offset: Annotated[
+        int,
+        typer.Option(
+            "--offset",
+            help="Number of memories to skip (for pagination).",
+        ),
+    ] = 0,
+    include_deleted: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Include soft-deleted memories (deleted_at IS NOT NULL).",
+        ),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
+    csv_output: Annotated[
+        bool,
+        typer.Option(
+            "--csv", help="Emit CSV output (id, created_at, deleted, category, tags, content)."
+        ),
+    ] = False,
+) -> None:
+    """List memories in reverse chronological order (newest first).
+
+    Default: live memories only. Pass --all to include soft-deleted rows
+    (useful for debugging data-repair migrations and audit checks).
+    Use --offset for paging through large sets.
+    """
+
+    if csv_output and json_output:
+        typer.echo("--csv and --json are mutually exclusive.", err=True)
+        raise typer.Exit(code=2)
+
+    result = _service_from_env().ilma_list_memories(
+        limit=limit,
+        offset=offset,
+        include_deleted=include_deleted,
+    )
+    _exit_if_failed(result, json_output=json_output)
+    rows = _json_safe(result.get("results", []))
+
+    if csv_output:
+        fieldnames = ["id", "created_at", "deleted", "category", "tags", "content"]
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            tags = row.get("tags") or []
+            writer.writerow(
+                {
+                    "id": row.get("id"),
+                    "created_at": _stringify_csv_value(row.get("created_at")),
+                    "deleted": row.get("deleted"),
+                    "category": row.get("category") or "",
+                    "tags": ",".join(map(str, tags)),
+                    "content": _stringify_csv_value(row.get("content")),
+                }
+            )
+        typer.echo(buf.getvalue().rstrip("\n"))
+        return
+
+    if json_output:
+        _echo_json(result)
+        return
+
+    if not rows:
+        typer.echo("No memories found.")
+        return
+
+    count = result.get("count", len(rows))
+    showing = f"showing {count}"
+    if include_deleted:
+        showing += " (including deleted)"
+    typer.echo(f"Memories: {showing} (limit={limit}, offset={offset})")
+    for row in rows:
+        memory_id = row.get("id", "?")
+        created_at = row.get("created_at")
+        created_str = ""
+        if isinstance(created_at, datetime):
+            created_str = created_at.strftime("%Y-%m-%d %H:%M:%S")
+        elif created_at is not None:
+            created_str = str(created_at)
+        deleted = bool(row.get("deleted"))
+        category = row.get("category") or "uncategorized"
+        tags = row.get("tags") or []
+        tags_str = ",".join(map(str, tags)) if tags else "-"
+        content = str(row.get("content", "")).replace("\n", " ")
+        if len(content) > 200:
+            content = content[:197] + "..."
+        deleted_marker = " [DELETED]" if deleted else ""
+        typer.echo(
+            f"[{memory_id}]{deleted_marker} {created_str}  category={category}  tags={tags_str}"
+        )
+        typer.echo(f"    {content}")
+
+
 def doctor(
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
 ) -> None:
@@ -570,9 +675,25 @@ def migrate(
         bool,
         typer.Option("--dry-run", help="Inspect hermes-memory v2 data without writing ilma rows."),
     ] = False,
+    reembed: Annotated[
+        bool,
+        typer.Option(
+            "--reembed",
+            help=(
+                "After schema migration, post-process live memories: clean corrupt "
+                "tags arrays, re-embed memories whose vector columns are zero "
+                "(source hermes-memory v2 did not pre-compute embeddings), and "
+                "chunk content that arrived with no chunks. Idempotent."
+            ),
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
 ) -> None:
-    """Migrate hermes-memory v2 data into ilma, or run ilma schema migrations."""
+    """Migrate hermes-memory v2 data into ilma, or run ilma schema migrations.
+
+    Pass --reembed on a non-pristine source DB to repair known migration
+    artifacts (corrupt tags, zero vectors, missing chunks). Safe to re-run.
+    """
 
     resolved_dsn = dsn
     if resolved_dsn is None:
@@ -602,14 +723,14 @@ def migrate(
                 typer.echo(str(result.get("message") or "No hermes-memory v2 schema found."))
             return
 
-    result = _service_from_env().ilma_migrate()
+    result = _service_from_env().ilma_migrate(reembed=reembed)
     _exit_if_failed(result, json_output=json_output)
     if json_output:
         _echo_json(result)
     else:
         typer.echo(
             f"Migration complete: surfaces={result.get('surfaces', len(SURFACES))} "
-            f"audit_log={result.get('audit_log', True)}"
+            f"audit_log={result.get('audit_log', True)}" + ("  reembed applied" if reembed else "")
         )
 
 
@@ -619,6 +740,7 @@ _CLI_TOOL_TO_COMMAND: Mapping[str, str] = {
     "ilma_recall": "recall",
     "ilma_remember": "remember",
     "ilma_forget": "forget",
+    "ilma_list_memories": "list",
     "ilma_doctor": "doctor",
     "ilma_repair": "repair",
     "ilma_audit": "audit",
@@ -670,6 +792,7 @@ def _register_service_commands(typer_app: typer.Typer) -> None:
         "ilma_recall": recall,
         "ilma_remember": remember,
         "ilma_forget": forget,
+        "ilma_list_memories": list_memories,
         "ilma_doctor": doctor,
         "ilma_repair": repair,
         "ilma_audit": audit,

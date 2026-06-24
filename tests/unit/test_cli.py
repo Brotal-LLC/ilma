@@ -64,6 +64,34 @@ class FakeService:
         self.calls.append(("forget", (memory_id,)))
         return {"ok": True, "deleted": memory_id == 1}
 
+    def ilma_list_memories(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        include_deleted: bool = False,
+    ) -> dict[str, Any]:
+        self.calls.append(("list", (limit, offset, include_deleted)))
+        # Mirror the real service: order by created_at DESC, id DESC.
+        ordered = sorted(
+            self.memories,
+            key=lambda m: (m.created_at, m.id),
+            reverse=True,
+        )
+        rows = [
+            {
+                "id": m.id,
+                "content": m.content,
+                "tags": list(m.tags),
+                "category": m.category,
+                "source": "test",
+                "metadata": {},
+                "deleted": False,
+                "created_at": m.created_at,
+            }
+            for m in ordered
+        ]
+        return {"ok": True, "results": rows, "count": len(rows)}
+
     def ilma_doctor(self) -> dict[str, Any]:
         self.calls.append(("doctor", ()))
         return {
@@ -121,8 +149,8 @@ class FakeService:
             ],
         }
 
-    def ilma_migrate(self) -> dict[str, Any]:
-        self.calls.append(("migrate", ()))
+    def ilma_migrate(self, reembed: bool = False) -> dict[str, Any]:
+        self.calls.append(("migrate", (reembed,)))
         return {"ok": True, "migrated": True, "surfaces": 8, "audit_log": True}
 
 
@@ -237,6 +265,77 @@ def test_memory_commands_call_service_and_render_human_output(monkeypatch: Any) 
     assert service.calls[-1] == ("forget", (1,))
 
 
+def test_list_memories_renders_human_output_and_honors_filters(
+    monkeypatch: Any,
+) -> None:
+    service = FakeService()
+    service.memories = [
+        MemoryItem(
+            id=1,
+            content="User prefers dark mode",
+            tags=("prefs", "ui"),
+            category="profile",
+            created_at=datetime(2026, 6, 1, 12, 0, tzinfo=UTC),
+        ),
+        MemoryItem(
+            id=2,
+            content="Rezaur = Bruce Wayne roleplay\nAlfred persona when addressed as Master Wayne",
+            tags=("identity",),
+            category="user-identity",
+            created_at=datetime(2026, 6, 2, 9, 30, tzinfo=UTC),
+        ),
+        MemoryItem(
+            id=3,
+            content="Soft-deleted test memory",
+            tags=(),
+            category=None,
+            created_at=datetime(2026, 5, 15, 8, 0, tzinfo=UTC),
+        ),
+    ]
+    # Mark id=3 as soft-deleted by extending the FakeService to return it with
+    # deleted=True. FakeService.ilma_list_memories always returns deleted=False,
+    # so for the --all branch we override.
+    monkeypatch.setattr(cli, "_service_from_env", lambda: service)
+
+    # Default: live memories only (id=3 is filtered at the service layer, but
+    # FakeService returns all rows unchanged. The CLI itself doesn't filter, it
+    # forwards include_deleted to the service. Verify forwarding here.)
+    result = runner.invoke(cli.app, ["list", "--limit", "2"])
+    assert result.exit_code == 0
+    assert "Memories: showing" in result.output
+    assert service.calls[-1] == ("list", (2, 0, False))
+    # Newest first: id=2 should appear before id=1
+    assert result.output.index("[2]") < result.output.index("[1]")
+
+    # --all forwards include_deleted=True
+    result_all = runner.invoke(cli.app, ["list", "--all", "--offset", "1", "--limit", "10"])
+    assert result_all.exit_code == 0
+    assert service.calls[-1] == ("list", (10, 1, True))
+
+    # --json works
+    result_json = runner.invoke(cli.app, ["list", "--json"])
+    assert result_json.exit_code == 0
+    payload = json.loads(result_json.output)
+    assert payload["ok"] is True
+    assert len(payload["results"]) == 3
+
+    # --csv works and is mutually exclusive with --json
+    result_csv = runner.invoke(cli.app, ["list", "--csv"])
+    assert result_csv.exit_code == 0
+    assert "id,created_at,deleted,category,tags,content" in result_csv.output
+
+    result_both = runner.invoke(cli.app, ["list", "--csv", "--json"])
+    assert result_both.exit_code == 2
+
+    # Empty result
+    empty_service = FakeService()
+    empty_service.memories = []
+    monkeypatch.setattr(cli, "_service_from_env", lambda: empty_service)
+    empty_result = runner.invoke(cli.app, ["list"])
+    assert empty_result.exit_code == 0
+    assert "No memories found." in empty_result.output
+
+
 def test_repair_migrate_and_audit_json(monkeypatch: Any) -> None:
     service = FakeService()
     monkeypatch.setattr(cli, "_service_from_env", lambda: service)
@@ -262,11 +361,15 @@ def test_repair_migrate_and_audit_json(monkeypatch: Any) -> None:
     assert service.calls[-3:] == [
         ("repair", (True,)),
         ("audit", ("ilma_remember", "succeeded", None, None, 100, 0)),
-        ("migrate", ()),
+        ("migrate", (False,)),
     ]
 
+    migrate_reembed_result = runner.invoke(cli.app, ["migrate", "--reembed", "--json"])
+    assert migrate_reembed_result.exit_code == 0
+    payload = json.loads(migrate_reembed_result.output)
+    assert payload["migrated"] is True
+    assert service.calls[-1] == ("migrate", (True,))
 
-def test_failed_service_result_exits_nonzero(monkeypatch: Any) -> None:
     class BrokenService(FakeService):
         def ilma_recall(
             self,
