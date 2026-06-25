@@ -232,6 +232,11 @@ class FakeBackend:
     def sessions_repo(self) -> FakeSessionsRepo:
         return self.sessions
 
+    def graph_repo(self) -> Any:
+        # Return None in the FakeBackend — the service must handle this
+        # gracefully (ilma_graph_rebuild returns an error response).
+        return None
+
 
 @pytest.fixture
 def service() -> IlmaMcpService:
@@ -262,6 +267,7 @@ async def test_mcp_server_registration_is_driven_by_tools_dict_loop(
         "ilma_recall",
         "ilma_recent",
         "ilma_get_memory",
+        "ilma_traverse",
         "ilma_list_memories",
         "ilma_get_wiki",
         "ilma_wiki_search",
@@ -309,7 +315,7 @@ async def test_mcp_server_write_tool_audits_once(service: IlmaMcpService) -> Non
 
 
 @pytest.mark.asyncio
-async def test_mcp_server_registers_expected_29_tools(service: IlmaMcpService) -> None:
+async def test_mcp_server_registers_expected_31_tools(service: IlmaMcpService) -> None:
     server = create_mcp_server(service)
     tools = await server.list_tools()
     names = {tool.name for tool in tools}
@@ -345,6 +351,8 @@ async def test_mcp_server_registers_expected_29_tools(service: IlmaMcpService) -
         "ilma_repair",
         "ilma_doctor",
         "ilma_migrate",
+        "ilma_graph_rebuild",
+        "ilma_traverse",
     }
 
 
@@ -383,6 +391,7 @@ def test_write_tools_are_audited_before_success(service: IlmaMcpService) -> None
         "ilma_obs_log",
         "ilma_migrate",
         "ilma_repair",
+        "ilma_graph_rebuild",
     }
     calls = [
         service.ilma_remember("new memory"),
@@ -396,8 +405,13 @@ def test_write_tools_are_audited_before_success(service: IlmaMcpService) -> None
         service.ilma_obs_log("info", "message"),
         service.ilma_migrate(),
         service.ilma_repair(),
+        # ilma_graph_rebuild requires a graph backend; in the FakeBackend
+        # above, graph_repo() returns None, so the call is expected to
+        # return ok=False (and STILL be audit-logged as a write).
+        service.ilma_graph_rebuild(),
     ]
-    assert all(call["ok"] for call in calls)
+    assert [call["ok"] for call in calls[:-1]] == [True] * (len(calls) - 1)
+    assert calls[-1]["ok"] is False  # ilma_graph_rebuild without backend
     audit_logger = service.audit
     assert isinstance(audit_logger, InMemoryAuditLogger)
     assert [record["tool_name"] for record in audit_logger.records] == list(WRITE_TOOLS)

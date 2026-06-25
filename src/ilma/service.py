@@ -282,6 +282,10 @@ class IlmaService:
         self.metrics = backend.metrics_repo()
         self.observability = backend.observability_repo()
         self.sessions = backend.sessions_repo()
+        # Graph repo is optional — the backend may not have graph_repo() if
+        # this is an InMemoryBackend or older backend class. Fall back to None
+        # so the service still imports.
+        self.graph = getattr(backend, "graph_repo", lambda: None)()
 
     @classmethod
     def from_env(cls) -> IlmaService:
@@ -931,6 +935,133 @@ class IlmaService:
             return _ok(healthy=overall, checks=checks)
 
         return self.call("ilma_doctor", run, {})
+
+    # Graph surface (Apache AGE) -----------------------------------------
+    def ilma_graph_rebuild(
+        self,
+        *,
+        min_shared_tags: int = 2,
+    ) -> dict[str, Any]:
+        """Drop and rebuild the ilma graph from current SQL state.
+
+        The graph is a derived view of ``ilma.memories``, ``ilma.wiki_docs``,
+        ``ilma.skills``, and session-membership data. Safe to re-run.
+
+        Parameters
+        ----------
+        min_shared_tags
+            Minimum number of shared tags for a ``SHARES_TAG`` edge between
+            two memories. Default 2.
+        """
+
+        def run() -> dict[str, Any]:
+            if self.graph is None:
+                return _err(
+                    RuntimeError(
+                        "graph backend not available; this build of ilma "
+                        "doesn't expose graph_repo()."
+                    )
+                )
+            from ilma.core.graph import plan_graph_rebuild
+
+            self.graph.ensure_schema()
+            # Pull the SQL state.
+            with self.graph.connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, category, tags, content, deleted_at,
+                           extract(epoch from created_at) AS created_at
+                    FROM ilma.memories
+                    """
+                )
+                memories = [
+                    {
+                        "id": r[0],
+                        "category": r[1],
+                        "tags": list(r[2] or []),
+                        "content": r[3] or "",
+                        "deleted": r[4] is not None,
+                        "created_at": r[5],
+                    }
+                    for r in cur.fetchall()
+                ]
+                cur.execute("SELECT id, slug, title FROM ilma.wiki_docs")
+                wikis = [{"id": r[0], "slug": r[1], "title": r[2]} for r in cur.fetchall()]
+                cur.execute("SELECT id, name FROM ilma.skills")
+                skills = [{"id": r[0], "name": r[1]} for r in cur.fetchall()]
+                cur.execute(
+                    """
+                    SELECT sm.content::bigint AS memory_id, sm.session_id
+                    FROM ilma.session_messages sm
+                    WHERE sm.role = 'memory_link' AND sm.content ~ '^[0-9]+$'
+                    """
+                )
+                # Join sessions via session_messages.content being the
+                # memory id (the convention used in v2 storage). This is
+                # an approximation — for production, the migrate tool
+                # records memory ids in observations directly.
+                session_memories = [{"memory_id": r[0], "session_id": r[1]} for r in cur.fetchall()]
+            plan = plan_graph_rebuild(
+                memories=memories,
+                wikis=wikis,
+                skills=skills,
+                session_memories=session_memories,
+                min_shared_tags=min_shared_tags,
+            )
+            stats = self.graph.rebuild(plan)
+            return _ok(stats=stats)
+
+        return self.call(
+            "ilma_graph_rebuild",
+            run,
+            {"min_shared_tags": min_shared_tags},
+        )
+
+    def ilma_traverse(
+        self,
+        *,
+        kind: str,
+        src_id: int,
+        max_hops: int = 2,
+        edge_types: list[str] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Bounded graph traversal from a vertex.
+
+        Returns the subgraph rooted at the vertex as ``{"nodes": [...],
+        "edges": [...]}``. Useful for "show me everything connected to
+        memory #42 within 2 hops" queries.
+        """
+
+        def run() -> dict[str, Any]:
+            if self.graph is None:
+                return _err(
+                    RuntimeError(
+                        "graph backend not available; this build of ilma "
+                        "doesn't expose graph_repo()."
+                    )
+                )
+            subgraph = self.graph.traverse(
+                kind=kind,
+                src_id=src_id,
+                max_hops=max_hops,
+                edge_types=edge_types,
+                limit=limit,
+            )
+            return _ok(subgraph=subgraph)
+
+        return self.call(
+            "ilma_traverse",
+            run,
+            {
+                "kind": kind,
+                "src_id": src_id,
+                "max_hops": max_hops,
+                "edge_types": edge_types,
+                "limit": limit,
+            },
+        )
 
     def ilma_audit(
         self,

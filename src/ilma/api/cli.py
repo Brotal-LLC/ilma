@@ -715,6 +715,24 @@ def migrate(
                     f"updated={result.get('updated', 0)} skipped={result.get('skipped', 0)} "
                     f"conflicts={result.get('conflicts', 0)}"
                 )
+            # Always also call ilma_migrate(reembed=True) when --reembed is set,
+            # even when v2 schema was detected. The v2 → ilma migration is
+            # content-hash-deduplicated, so re-running it on an already-migrated
+            # DB is a no-op (inserted=0). The repair pass then runs the actual
+            # fix-up logic (corrupt tags, zero vectors, missing chunks).
+            if reembed:
+                result2 = _service_from_env().ilma_migrate(reembed=True)
+                _exit_if_failed(result2, json_output=json_output)
+                if json_output:
+                    _echo_json(result2)
+                else:
+                    repair_stats = result2.get("reembed") or {}
+                    typer.echo(
+                        f"Reembed pass: tags_cleaned={repair_stats.get('tags_cleaned', 0)} "
+                        f"memories_embedded={repair_stats.get('memories_embedded', 0)} "
+                        f"chunks_created={repair_stats.get('chunks_created', 0)} "
+                        f"skipped={repair_stats.get('skipped', '')}"
+                    )
             return
         if dry_run:
             if json_output:

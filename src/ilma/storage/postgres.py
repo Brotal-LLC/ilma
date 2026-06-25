@@ -6,6 +6,7 @@ psycopg_pool, Postgres full-text search, and pgvector chunk embeddings.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from collections.abc import Sequence
@@ -35,9 +36,15 @@ from ilma.core.skills import Skill, SkillsRepo
 from ilma.core.wiki import WikiDoc, WikiRepo
 from ilma.embeddings import DEFAULT_DIM, SUPPORTED_DIMS, EmbedderRegistry
 from ilma.storage.base import StorageBackend
+from ilma.storage.postgres_graph import (  # noqa: E501
+    PgGraphRepo,
+    ensure_age_extension,
+    ensure_graph,
+)
 
 _POOL_CACHE: dict[tuple[str, int, int], ConnectionPool] = {}
 _POOL_LOCK = threading.Lock()
+log = logging.getLogger(__name__)
 
 
 def _get_pool(dsn: str, *, min_size: int = 1, max_size: int = 8) -> ConnectionPool:
@@ -1555,6 +1562,17 @@ class PgBackend(StorageBackend):
         with self._pool.connection() as connection:
             connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
             connection.execute("CREATE SCHEMA IF NOT EXISTS ilma")
+            # AGE is best-effort: not every Postgres image has the binary,
+            # so we swallow ImportError / UndefinedFile / UndefinedExtension
+            # here and let the graph tools surface a clear error on first use.
+            try:
+                ensure_age_extension(self._dsn)
+                ensure_graph(self._dsn)
+            except Exception:
+                log.warning(
+                    "AGE extension unavailable; graph tools will fail until installed",
+                    exc_info=True,
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ilma.backend_items (
@@ -1616,6 +1634,19 @@ class PgBackend(StorageBackend):
 
     def observability_repo(self) -> PgObservabilityRepo:
         return PgObservabilityRepo(
+            self._dsn,
+            min_pool_size=self._min_pool_size,
+            max_pool_size=self._max_pool_size,
+        )
+
+    def graph_repo(self) -> PgGraphRepo:
+        """Return the Apache AGE graph repository for cross-entity traversal.
+
+        The graph is a derived view over memories, wikis, and skills. See
+        ``ilma.storage.postgres_graph`` and the ``ilma-age-graph`` skill for
+        design notes.
+        """
+        return PgGraphRepo(
             self._dsn,
             min_pool_size=self._min_pool_size,
             max_pool_size=self._max_pool_size,

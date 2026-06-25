@@ -137,6 +137,7 @@ def test_write_tools_set_unchanged() -> None:
         "ilma_obs_log": ("observability", "log"),
         "ilma_migrate": ("maintenance", "migrate"),
         "ilma_repair": ("maintenance", "repair"),
+        "ilma_graph_rebuild": ("graph", "rebuild"),
     }
 
     assert dict(WRITE_TOOLS) == previous_hand_maintained_mapping
