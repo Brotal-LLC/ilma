@@ -217,30 +217,43 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          # NOTE: do NOT set `images:` here. With `images:` set, every
-          # raw tag gets prepended with a slugified form of the image path
-          # (e.g. `ghcr.io-brotal-llc-ilma-`), which mangles tags like
-          # `main` and `latest` into `ghcr.io-brotal-llc-ilma-main` and
-          # `ghcr.io-brotal-llc-ilma-latest`. Write the full image:tag
-          # string explicitly instead.
-          tags: |
-            type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.tag.outputs.build_tag }}
-            type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:workflow,enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-            type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-            type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+      - name: Resolve image tags
+        id: tags
+        run: |
+          # Build the full registry/path:tag list without using
+          # docker/metadata-action. v5/v6 of that action rewrites raw
+          # tag values to a slugified image-name form (e.g.
+          # `ghcr.io/brotal-llc/ilma:main` becomes
+          # `ghcr.io-brotal-llc-ilma-main`), so we build the tag list in a
+          # shell step and hand it straight to build-push-action.
+          SHORT_SHA="${GITHUB_SHA::7}"
+          EVENT="${GITHUB_EVENT_NAME:-push}"
+          REF="${GITHUB_REF:-refs/heads/main}"
+          TAGS="${REGISTRY}/${IMAGE_NAME}:${SHORT_SHA}"
+          if [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
+            TAGS="${TAGS},${REGISTRY}/${IMAGE_NAME}:main,${REGISTRY}/${IMAGE_NAME}:latest"
+          fi
+          if [ "$EVENT" = "push" ] && [[ "$REF" == refs/tags/v* ]]; then
+            TAG_NAME="${REF#refs/tags/}"
+            TAGS="${TAGS},${REGISTRY}/${IMAGE_NAME}:${TAG_NAME}"
+          fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            TAGS="${TAGS},${REGISTRY}/${IMAGE_NAME}:workflow"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Pushing tags: ${TAGS}"
 
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=ilma
+            org.opencontainers.image.description=Framework-agnostic agent memory system — Postgres + pgvector + MCP
+            org.opencontainers.image.source=https://github.com/Brotal-LLC/ilma
+            org.opencontainers.image.url=https://github.com/Brotal-LLC/ilma
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
