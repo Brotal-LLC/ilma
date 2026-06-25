@@ -22,9 +22,11 @@ Test surface:
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import psycopg
 import pytest
+from testcontainers.core.image import DockerImage
 from testcontainers.postgres import PostgresContainer
 
 from ilma.core.graph import plan_graph_rebuild
@@ -36,24 +38,49 @@ from ilma.storage.postgres_graph import (
     ensure_graph,
 )
 
-# Use Shakib's own image — same versions as production.
-# Use ilma's own production DB image — same image that backs
-# production deployments, built by .github/workflows/ilma.yml (build-pg job).
-IMAGE = "ghcr.io/brotal-llc/ilma-pg:latest"
+# Build ilma-pg from the repo's own pg/Dockerfile via testcontainers so
+# the integration tests are self-contained and don't depend on the image
+# being published to GHCR first. The build happens once per pytest
+# session; cached layers make subsequent runs fast.
+#
+# The resulting image is the same one that CI publishes as
+# ``ghcr.io/brotal-llc/ilma-pg:latest`` — Postgres 18 + pgvector + pg_cron
+# + timescaledb + pg_trgm + ltree + apache-age. Schema bootstrap is
+# handled by the container's ilma-pg-init.sh entrypoint.
+IMAGE_TAG = "ilma-pg:testcontainers"
 
 
 @pytest.fixture(scope="session")
-def age_dsn() -> Iterator[str]:
+def ilma_pg_image() -> Iterator[str]:
+    """Build the ilma-pg image from pg/Dockerfile and yield its tag.
+
+    The build is session-scoped so it runs once per ``pytest`` invocation.
+    Cached Docker layers make the second-and-later runs effectively free.
+    On exit the image is kept (clean_up=False) so re-runs skip the build
+    entirely; remove with ``docker rmi ilma-pg:testcontainers`` if needed.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    with DockerImage(
+        path=str(repo_root),
+        dockerfile_path="pg/Dockerfile",
+        tag=IMAGE_TAG,
+        clean_up=False,
+    ):
+        # The context manager handles build + cleanup. We only need the tag
+        # for PostgresContainer(image=...).
+        yield IMAGE_TAG
+
+
+@pytest.fixture(scope="session")
+def age_dsn(ilma_pg_image: str) -> Iterator[str]:
     """Spin up Postgres + pgvector + age. Session-scoped for speed."""
     with PostgresContainer(
-        IMAGE,
+        ilma_pg_image,
         username="test",
         password="test",
         dbname="test",
         driver=None,
     ) as postgres:
-        # Make sure age is in shared_preload_libraries.
-        # The hermes-postgres image already has this, but assert anyway.
         yield postgres.get_connection_url()
 
 
