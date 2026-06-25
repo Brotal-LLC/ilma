@@ -184,6 +184,8 @@ def test_ilma_recall_audit_records_payload(fake_service: _FakeService) -> None:
         "limit": 3,
         "threshold": 0.5,
         "hybrid_text_weight": 0.5,
+        "expand_graph": False,
+        "graph_hops": 1,
     }
 
 
@@ -216,7 +218,14 @@ def test_tools_dict_includes_ilma_recall() -> None:
 
     input_model = registry["ilma_recall"]["input_model"]
     field_names = set(input_model.model_fields.keys())
-    assert field_names == {"query", "limit", "threshold", "hybrid_text_weight"}
+    assert field_names == {
+        "query",
+        "limit",
+        "threshold",
+        "hybrid_text_weight",
+        "expand_graph",
+        "graph_hops",
+    }
 
 
 def test_recall_is_a_read_tool_not_a_write_tool() -> None:

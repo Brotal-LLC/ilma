@@ -86,7 +86,7 @@ def test_only_four_typer_commands_are_hand_written() -> None:
         if not getattr(callback, "__ilma_auto_registered__", False)
     }
 
-    assert hand_written == {"init", "mcp", "serve", "migrate-config"}
+    assert hand_written == {"init", "mcp", "serve", "migrate-config", "graph"}
 
 
 def test_expected_service_commands_are_auto_registered() -> None:

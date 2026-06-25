@@ -463,6 +463,9 @@ class IlmaService:
         limit: int = 10,
         threshold: float = 0.0,
         hybrid_text_weight: float = 0.5,
+        *,
+        expand_graph: bool = False,
+        graph_hops: int = 1,
     ) -> dict[str, Any]:
         """Recall memories relevant to a query.
 
@@ -482,6 +485,15 @@ class IlmaService:
         hybrid_text_weight:
             Weight given to keyword/lexical matches vs vector matches
             (0.0 = pure vector, 1.0 = pure keyword, default 0.5).
+        expand_graph:
+            When True (default False), after the SQL/pgvector recall,
+            expand each hit's neighbor set by traversing up to ``graph_hops``
+            hops in the ilma graph. Returns the union as ``graph_neighbors``.
+            Disabled by default — graph is a derived view that may be stale,
+            so callers should opt in explicitly.
+        graph_hops:
+            Max traversal depth when ``expand_graph`` is True. 1..3,
+            default 1 (immediate neighbors only).
         """
 
         def run() -> dict[str, Any]:
@@ -492,7 +504,53 @@ class IlmaService:
                 hybrid_text_weight=hybrid_text_weight,
             )
             results = self._filter_by_threshold(raw, threshold)
-            return _ok(results=results, count=len(results), query=query, limit=capped_limit)
+            graph_neighbors: list[dict[str, Any]] = []
+            if expand_graph and self.graph is not None and results:
+                seen_ids: set[int] = set()
+                for r in results:
+                    rid = getattr(r, "id", None)
+                    if rid is None and isinstance(r, Mapping):
+                        rid = r.get("id")
+                    if rid is None:
+                        continue
+                    seen_ids.add(int(rid))
+                for r in results:
+                    rid = getattr(r, "id", None)
+                    if rid is None and isinstance(r, Mapping):
+                        rid = r.get("id")
+                    if rid is None:
+                        continue
+                    try:
+                        sub = self.graph.traverse(
+                            kind="Memory",
+                            src_id=int(rid),
+                            max_hops=max(1, min(int(graph_hops), 3)),
+                            limit=20,
+                        )
+                    except Exception:  # graceful degrade — recall is the primary deliverable
+                        continue
+                    for n in sub["nodes"]:
+                        if n["kind"] != "Memory":
+                            continue
+                        nid = int(n["src_id"])
+                        if nid in seen_ids:
+                            continue
+                        seen_ids.add(nid)
+                        graph_neighbors.append(
+                            {
+                                "id": nid,
+                                "kind": n["kind"],
+                                "via_memory_id": int(rid),
+                                "properties": n["properties"],
+                            }
+                        )
+            return _ok(
+                results=results,
+                count=len(results),
+                query=query,
+                limit=capped_limit,
+                graph_neighbors=graph_neighbors,
+            )
 
         return self.call(
             "ilma_recall",
@@ -502,6 +560,8 @@ class IlmaService:
                 "limit": limit,
                 "threshold": threshold,
                 "hybrid_text_weight": hybrid_text_weight,
+                "expand_graph": expand_graph,
+                "graph_hops": graph_hops,
             },
         )
 
@@ -580,11 +640,88 @@ class IlmaService:
     def ilma_get_wiki(self, slug: str) -> dict[str, Any]:
         return self.call("ilma_get_wiki", lambda: _ok(document=self.wiki.get(slug)), {"slug": slug})
 
-    def ilma_wiki_search(self, query: str, top_k: int = 5) -> dict[str, Any]:
+    def ilma_wiki_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        expand_graph: bool = False,
+        graph_hops: int = 1,
+    ) -> dict[str, Any]:
+        """Search wikis by FTS. Optionally expand with graph neighbors.
+
+        Parameters
+        ----------
+        query:
+            Search query.
+        top_k:
+            Maximum number of results (1-50, default 5).
+        expand_graph:
+            When True, expand each hit's neighbor set in the ilma graph.
+            Disabled by default.
+        graph_hops:
+            Max traversal depth when ``expand_graph`` is True. 1..3,
+            default 1.
+        """
+
+        def run() -> dict[str, Any]:
+            capped = _limit(top_k, default=5)
+            results = self.wiki.search(query, top_k=capped)
+            graph_neighbors: list[dict[str, Any]] = []
+            if expand_graph and self.graph is not None and results:
+                seen_ids: set[int] = set()
+                for r in results:
+                    rid = getattr(r, "id", None)
+                    if rid is None and isinstance(r, Mapping):
+                        rid = r.get("id")
+                    if rid is None:
+                        continue
+                    seen_ids.add(int(rid))
+                for r in results:
+                    rid = getattr(r, "id", None)
+                    if rid is None and isinstance(r, Mapping):
+                        rid = r.get("id")
+                    if rid is None:
+                        continue
+                    try:
+                        sub = self.graph.traverse(
+                            kind="Wiki",
+                            src_id=int(rid),
+                            max_hops=max(1, min(int(graph_hops), 3)),
+                            limit=20,
+                        )
+                    except Exception:  # graceful degrade — search is the primary deliverable
+                        continue
+                    for n in sub["nodes"]:
+                        nid = int(n["src_id"])
+                        if nid in seen_ids:
+                            continue
+                        seen_ids.add(nid)
+                        graph_neighbors.append(
+                            {
+                                "id": nid,
+                                "kind": n["kind"],
+                                "via_wiki_id": int(rid),
+                                "properties": n["properties"],
+                            }
+                        )
+            return _ok(
+                results=results,
+                count=len(results),
+                query=query,
+                top_k=capped,
+                graph_neighbors=graph_neighbors,
+            )
+
         return self.call(
             "ilma_wiki_search",
-            lambda: _ok(results=self.wiki.search(query, top_k=_limit(top_k, default=5))),
-            {"query": query, "top_k": top_k},
+            run,
+            {
+                "query": query,
+                "top_k": top_k,
+                "expand_graph": expand_graph,
+                "graph_hops": graph_hops,
+            },
         )
 
     def ilma_list_wiki(self, limit: int = 50, offset: int = 0) -> dict[str, Any]:

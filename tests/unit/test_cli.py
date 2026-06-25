@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from typer.testing import CliRunner
 
 from ilma.api import cli
@@ -40,8 +41,9 @@ class FakeService:
         limit: int = 10,
         threshold: float = 0.0,
         hybrid_text_weight: float = 0.5,
+        **kwargs: Any,
     ) -> dict[str, Any]:
-        self.calls.append(("recall", (query, limit, threshold, hybrid_text_weight)))
+        self.calls.append(("recall", (query, limit, threshold, hybrid_text_weight, kwargs)))
         return {
             "ok": True,
             "results": self.memories if query else [],
@@ -249,7 +251,10 @@ def test_memory_commands_call_service_and_render_human_output(monkeypatch: Any) 
     )
     assert recall_result.exit_code == 0
     assert "[1] User prefers dark mode" in recall_result.output
-    assert service.calls[-1] == ("recall", ("dark", 3, 0.0, 0.25))
+    assert service.calls[-1] == (
+        "recall",
+        ("dark", 3, 0.0, 0.25, {"expand_graph": False, "graph_hops": 1}),
+    )
 
     remember_result = runner.invoke(
         cli.app,
@@ -377,6 +382,7 @@ def test_repair_migrate_and_audit_json(monkeypatch: Any) -> None:
             limit: int = 10,
             threshold: float = 0.0,
             hybrid_text_weight: float = 0.5,
+            **kwargs: Any,
         ) -> dict[str, Any]:
             return {"ok": False, "error": {"type": "RuntimeError", "message": "boom"}}
 
@@ -463,3 +469,232 @@ def test_serve_and_mcp_start_servers(monkeypatch: Any) -> None:
     mcp_result = runner.invoke(cli.app, ["mcp"])
     assert mcp_result.exit_code == 0
     assert server.ran is True
+
+
+# ---------------------------------------------------------------------------
+# Graph CLI command tests
+# ---------------------------------------------------------------------------
+
+
+def test_graph_command_rebuild_invokes_service_and_renders_human_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ilma graph rebuild` calls ilma_graph_rebuild and prints stats."""
+    from typer.testing import CliRunner
+
+    class GraphService:
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        def ilma_graph_rebuild(self, *, min_shared_tags: int) -> dict[str, Any]:
+            self.calls.append(("rebuild", min_shared_tags))
+            return {
+                "ok": True,
+                "stats": {
+                    "memory_vertices": 43,
+                    "wiki_vertices": 5,
+                    "skill_vertices": 1,
+                    "shares_tag_edges": 232,
+                    "co_occurs_edges": 0,
+                    "references_wiki_edges": 6,
+                    "uses_skill_edges": 0,
+                },
+            }
+
+        def ilma_traverse(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("traverse should not be called for rebuild")
+
+    svc = GraphService()
+    monkeypatch.setattr(cli, "_service_from_env", lambda: svc)
+
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["graph", "rebuild", "--min-shared-tags", "3"])
+    assert result.exit_code == 0
+    assert svc.calls == [("rebuild", 3)]
+    assert "Graph rebuilt:" in result.output
+    assert "memory_vertices: 43" in result.output
+    assert "shares_tag_edges: 232" in result.output
+
+
+def test_graph_command_rebuild_json_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    class GraphService:
+        def ilma_graph_rebuild(self, *, min_shared_tags: int) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "stats": {
+                    "memory_vertices": 10,
+                    "wiki_vertices": 1,
+                    "skill_vertices": 0,
+                    "shares_tag_edges": 0,
+                    "co_occurs_edges": 0,
+                    "references_wiki_edges": 0,
+                    "uses_skill_edges": 0,
+                },
+            }
+
+        def ilma_traverse(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError
+
+    monkeypatch.setattr(cli, "_service_from_env", lambda: GraphService())
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["graph", "rebuild", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["stats"]["memory_vertices"] == 10
+
+
+def test_graph_command_traverse_requires_src_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    class GraphService:
+        def ilma_traverse(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("must not be called without --src-id")
+
+        def ilma_graph_rebuild(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError
+
+    monkeypatch.setattr(cli, "_service_from_env", lambda: GraphService())
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["graph", "traverse"])
+    assert result.exit_code == 2
+    assert "--src-id is required" in result.output
+
+
+def test_graph_command_traverse_invokes_service_and_renders_human_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    class GraphService:
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        def ilma_traverse(
+            self,
+            *,
+            kind: str,
+            src_id: int,
+            max_hops: int,
+            edge_types: list[str] | None,
+            limit: int,
+        ) -> dict[str, Any]:
+            self.calls.append(
+                {
+                    "kind": kind,
+                    "src_id": src_id,
+                    "max_hops": max_hops,
+                    "edge_types": edge_types,
+                    "limit": limit,
+                }
+            )
+            return {
+                "ok": True,
+                "subgraph": {
+                    "nodes": [
+                        {
+                            "kind": "Memory",
+                            "src_id": 99,
+                            "vertex_id": 1,
+                            "properties": {"id": 99, "category": "fact"},
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "edge_id": 7,
+                            "label": "SHARES_TAG",
+                            "start_id": 1,
+                            "end_id": 99,
+                            "properties": {"tags": ["a", "b"]},
+                        }
+                    ],
+                },
+            }
+
+        def ilma_graph_rebuild(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError
+
+    svc = GraphService()
+    monkeypatch.setattr(cli, "_service_from_env", lambda: svc)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.app,
+        [
+            "graph",
+            "traverse",
+            "--kind",
+            "Memory",
+            "--src-id",
+            "1",
+            "--max-hops",
+            "2",
+            "--edge-type",
+            "SHARES_TAG",
+            "--edge-type",
+            "REFERENCES_WIKI",
+            "--limit",
+            "10",
+        ],
+    )
+    assert result.exit_code == 0
+    assert svc.calls == [
+        {
+            "kind": "Memory",
+            "src_id": 1,
+            "max_hops": 2,
+            "edge_types": ["SHARES_TAG", "REFERENCES_WIKI"],
+            "limit": 10,
+        }
+    ]
+    assert "1 node(s), 1 edge(s)" in result.output
+    assert "node: kind=Memory src_id=99" in result.output
+    assert "edge: SHARES_TAG 1->99" in result.output
+
+
+def test_graph_command_traverse_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    class GraphService:
+        def ilma_traverse(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "subgraph": {"nodes": [], "edges": []},
+            }
+
+        def ilma_graph_rebuild(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError
+
+    monkeypatch.setattr(cli, "_service_from_env", lambda: GraphService())
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["graph", "traverse", "--src-id", "42", "--json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["subgraph"]["nodes"] == []
+
+
+def test_graph_command_unknown_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    class GraphService:
+        def ilma_graph_rebuild(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError
+
+        def ilma_traverse(self, **kwargs: Any) -> dict[str, Any]:
+            raise AssertionError
+
+    monkeypatch.setattr(cli, "_service_from_env", lambda: GraphService())
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["graph", "delete"])
+    assert result.exit_code == 2
+    assert "Unknown graph action" in result.output

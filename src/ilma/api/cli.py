@@ -376,12 +376,33 @@ def recall(
         float,
         typer.Option("--hybrid-text-weight", min=0.0, max=1.0),
     ] = 0.5,
+    expand_graph: Annotated[
+        bool,
+        typer.Option(
+            "--expand-graph",
+            help="Expand recall hits with 1-hop graph neighbors.",
+        ),
+    ] = False,
+    graph_hops: Annotated[
+        int,
+        typer.Option(
+            "--graph-hops",
+            min=1,
+            max=3,
+            help="Max traversal depth when --expand-graph is set.",
+        ),
+    ] = 1,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
 ) -> None:
     """Recall memories relevant to a query. Canonical recall surface."""
 
     result = _service_from_env().ilma_recall(
-        query, limit=limit, threshold=threshold, hybrid_text_weight=hybrid_text_weight
+        query,
+        limit=limit,
+        threshold=threshold,
+        hybrid_text_weight=hybrid_text_weight,
+        expand_graph=expand_graph,
+        graph_hops=graph_hops,
     )
     _exit_if_failed(result, json_output=json_output)
     if json_output:
@@ -405,6 +426,20 @@ def recall(
         category = item.get("category") or "uncategorized"
         typer.echo(f"[{memory_id}] {content}")
         typer.echo(f"    category={category} tags={', '.join(map(str, tags)) if tags else '-'}")
+
+    if expand_graph:
+        neighbors = _json_safe(result.get("graph_neighbors", []))
+        if neighbors:
+            typer.echo(f"\nGraph neighbors ({len(neighbors)}, max_hops={graph_hops}):")
+            for n in neighbors:
+                if not isinstance(n, Mapping):
+                    continue
+                nid = n.get("id", "?")
+                kind = n.get("kind", "?")
+                via = n.get("via_memory_id")
+                props = n.get("properties") or {}
+                category = props.get("category") or ""
+                typer.echo(f"  [{nid}] kind={kind} via_memory={via} category={category or '-'}")
 
 
 def remember(
@@ -889,6 +924,137 @@ def mcp_command() -> None:
     """Start the MCP server."""
 
     create_mcp_server().run()
+
+
+# ---------------------------------------------------------------------------
+# Graph subcommand
+# ---------------------------------------------------------------------------
+
+
+@app.command("graph")
+def graph_command(
+    action: Annotated[
+        str,
+        typer.Argument(
+            help="Graph action.",
+            case_sensitive=False,
+        ),
+    ] = "rebuild",
+    min_shared_tags: Annotated[
+        int,
+        typer.Option(
+            "--min-shared-tags",
+            min=1,
+            help="Minimum number of shared tags for a SHARES_TAG edge.",
+        ),
+    ] = 2,
+    kind: Annotated[
+        str,
+        typer.Option(
+            "--kind",
+            "-k",
+            help="Vertex kind (for traverse).",
+            case_sensitive=False,
+        ),
+    ] = "Memory",
+    src_id: Annotated[
+        int,
+        typer.Option(
+            "--src-id",
+            help="Source vertex SQL id (for traverse).",
+        ),
+    ] = 0,
+    max_hops: Annotated[
+        int,
+        typer.Option("--max-hops", min=0, max=3),
+    ] = 2,
+    edge_types: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--edge-type",
+            help="Edge-type whitelist (repeatable).",
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=500),
+    ] = 50,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output.")] = False,
+) -> None:
+    """Manage the ilma graph layer (Apache AGE).
+
+    \b
+    Actions:
+      rebuild       Drop and rebuild the graph from current SQL state.
+      traverse      Bounded BFS from a vertex (requires --kind and --src-id).
+    """
+    action_normalized = action.lower()
+    if action_normalized == "rebuild":
+        result = _service_from_env().ilma_graph_rebuild(min_shared_tags=min_shared_tags)
+        _exit_if_failed(result, json_output=json_output)
+        if json_output:
+            _echo_json(result)
+            return
+        stats = result.get("stats") or {}
+        typer.echo("Graph rebuilt:")
+        for key in (
+            "memory_vertices",
+            "wiki_vertices",
+            "skill_vertices",
+            "shares_tag_edges",
+            "co_occurs_edges",
+            "references_wiki_edges",
+            "uses_skill_edges",
+        ):
+            typer.echo(f"  {key}: {stats.get(key, 0)}")
+        return
+    if action_normalized == "traverse":
+        if src_id <= 0:
+            typer.secho(
+                "--src-id is required for traverse (must be > 0).",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(2)
+        result = _service_from_env().ilma_traverse(
+            kind=kind,
+            src_id=src_id,
+            max_hops=max_hops,
+            edge_types=edge_types,
+            limit=limit,
+        )
+        _exit_if_failed(result, json_output=json_output)
+        if json_output:
+            _echo_json(result)
+            return
+        sub = _json_safe(result.get("subgraph") or {})
+        nodes = sub.get("nodes", [])
+        edges = sub.get("edges", [])
+        typer.echo(
+            f"Traverse from {kind}#{src_id} (max_hops={max_hops}, "
+            f"limit={limit}, edge_types={edge_types or 'all'}):"
+        )
+        typer.echo(f"  {len(nodes)} node(s), {len(edges)} edge(s)")
+        for n in nodes[:limit]:
+            if not isinstance(n, Mapping):
+                continue
+            typer.echo(
+                f"  node: kind={n.get('kind')} src_id={n.get('src_id')} props={n.get('properties')}"
+            )
+        for e in edges[:limit]:
+            if not isinstance(e, Mapping):
+                continue
+            typer.echo(
+                f"  edge: {e.get('label')} {e.get('start_id')}->{e.get('end_id')} "
+                f"props={e.get('properties')}"
+            )
+        return
+    typer.secho(
+        f"Unknown graph action: {action!r}. Use 'rebuild' or 'traverse'.",
+        fg=typer.colors.RED,
+        err=True,
+    )
+    raise typer.Exit(2)
 
 
 def main(args: Sequence[str] | None = None) -> None:
