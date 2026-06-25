@@ -75,7 +75,7 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: [self-hosted, Linux, X64, inframework]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: actionlint
         run: |
@@ -120,7 +120,7 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           version: "latest"
@@ -155,7 +155,7 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: [self-hosted, Linux, X64, inframework]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: TruffleHog secret scan
@@ -205,13 +205,13 @@ jobs:
       REGISTRY: ghcr.io
       IMAGE_NAME: brotal-llc/ilma
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -219,7 +219,7 @@ jobs:
 
       - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -230,7 +230,7 @@ jobs:
             type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -277,7 +277,7 @@ jobs:
       id-token: write
     environment: production
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -342,7 +342,7 @@ jobs:
 
       - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: "Release ${{ github.ref_name }}"
