@@ -221,7 +221,12 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # NOTE: do NOT set `images:` here. With `images:` set, every
+          # raw tag gets prepended with a slugified form of the image path
+          # (e.g. `ghcr.io-brotal-llc-ilma-`), which mangles tags like
+          # `main` and `latest` into `ghcr.io-brotal-llc-ilma-main` and
+          # `ghcr.io-brotal-llc-ilma-latest`. Write the full image:tag
+          # string explicitly instead.
           tags: |
             type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.tag.outputs.build_tag }}
             type=raw,value=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:workflow,enable=${{ github.event_name == 'workflow_dispatch' }}
