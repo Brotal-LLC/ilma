@@ -61,6 +61,13 @@ FROM pgvector/pgvector:pg${PG_MAJOR} AS runtime
 ARG PG_MAJOR
 
 ENV DEBIAN_FRONTEND=noninteractive
+# Override the new (PG18+) single-mount default so users upgrading from
+# the legacy `skb50bd/hermes-memory/hermes-postgres` image (which used
+# the /var/lib/postgresql/data layout) don't have to migrate their
+# data directory. This keeps the named-volume contract backward-
+# compatible: `docker run -v ilma-pg-data:/var/lib/postgresql/data ...`
+# works whether you're starting fresh or moving from the legacy image.
+ENV PGDATA=/var/lib/postgresql/data
 
 # Bring forward the apt sources, keyrings, AND ca-certificates from
 # the builder (which has ca-certificates installed). We need

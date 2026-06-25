@@ -130,8 +130,18 @@ in the named volume.
 **Why not bake the model into the image?** BuildKit's sandbox can't
 reliably reach a long-running background `ollama serve` from inside a
 single `RUN` step, so we can't pre-pull at build time. Pulling on every
-start (with named-volume caching) is faster on subsequent runs and
-keeps the image small (~1GB instead of ~3.2GB).
+start (with named-volume caching) is faster on subsequent runs.
+
+**Image size: ~6.6GB.** The `ollama/ollama` base image is 6.6GB on
+disk regardless of variant (the `-rocm` tags are larger). There's no
+slimmer official ollama image — the binary + Go runtime + Ubuntu base
+is just that big. If size matters, consider:
+- A custom fork that strips ROCm/CUDA from the official binary (~1.5GB
+  reduction, but you'd need to maintain it).
+- A pure-Python replacement using `llama.cpp` Python bindings
+  (~500MB, but no HTTP API, no model registry).
+- For now we accept the 6.6GB floor — ollama is feature-complete and
+  well-supported.
 
 ### ilma-agent (the API/MCP service)
 
