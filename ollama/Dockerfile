@@ -2,47 +2,24 @@
 #
 # ghcr.io/brotal-llc/ilma-ollama
 #
-# Thin wrapper over ollama/ollama that pre-pulls the bge-m3 model so ilma
-# installations can point ILMA_EMBED_BASE_URL at this image and have a
-# working embedder within seconds of `docker run`.
+# Thin wrapper over ollama/ollama. The bge-m3 model is NOT pulled at
+# image build time because (a) BuildKit's sandbox can't reliably reach
+# a long-running background ollama server inside a single RUN step, and
+# (b) pulling a 2.2GB model on every CI build is wasteful when the
+# model rarely changes.
 #
-# Build strategy: ollama pull needs a running ollama server, so we can't
-# just `RUN ollama pull bge-m3` directly. Instead:
-#   1. Start ollama serve in the background.
-#   2. Wait for the API to come up.
-#   3. Pull bge-m3 into the image's /root/.ollama dir.
-#   4. Stop the background server.
+# Instead, the entrypoint (ollama/bin/ilma-ollama-entrypoint.sh) ensures
+# bge-m3 is pulled on every container start. Idempotent: when the named
+# volume /root/.ollama already has the model, the pull is a no-op.
+# First start takes 1-3 minutes (download + extract); subsequent starts
+# are instant.
 #
-# The resulting image has the model pre-pulled at /root/.ollama. At runtime,
-# the entrypoint pulls again only if the model is missing (e.g. user started
-# with a fresh named volume). Persistent deployments keep the model in the
-# named volume so startup is instant.
+# To pre-pull the model offline and bake it into a custom image, run:
+#   docker run --rm -v ilma-ollama-data:/root/.ollama ghcr.io/brotal-llc/ilma-ollama:latest pull bge-m3
+#   docker commit <container> my-llama:local
+# Or set OLLAMA_MODEL to a different model via -e.
 
 FROM ollama/ollama:latest
-
-# Pull the model eagerly during the image build so the first `docker run`
-# is instant. The model is ~2.2GB and downloads at build time, not at
-# container start.
-#
-# Three stages: start ollama serve, wait for it, pull bge-m3, stop ollama.
-# Buildkit's RUN supports inline bash, so we chain them with `&&`.
-ARG OLLAMA_MODEL=bge-m3
-RUN set -eux; \
-    ollama serve >/tmp/ollama-build.log 2>&1 & \
-    OLLAMA_PID=$!; \
-    for i in $(seq 1 120); do \
-        if curl -fsS http://localhost:11434/api/version >/dev/null 2>&1; then break; fi; \
-        sleep 1; \
-    done; \
-    if ! curl -fsS http://localhost:11434/api/version >/dev/null 2>&1; then \
-        echo "ollama server failed to come up during build:" >&2; \
-        cat /tmp/ollama-build.log >&2; \
-        kill $OLLAMA_PID 2>/dev/null || true; \
-        exit 1; \
-    fi; \
-    ollama pull "$OLLAMA_MODEL"; \
-    kill $OLLAMA_PID; \
-    wait $OLLAMA_PID 2>/dev/null || true
 
 # Healthcheck — Ollama's HTTP API responds on /api/tags once the server is up.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=10 \
@@ -51,9 +28,11 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=10 \
 # Expose the Ollama HTTP API on its default port.
 EXPOSE 11434
 
-# Runtime entrypoint: ensures bge-m3 is pulled (idempotent — noop if model
-# is already in the named volume /root/.ollama), then execs the foreground
-# `ollama serve` so Docker sees it as PID 1.
+# Runtime entrypoint: ensures the configured model is pulled (idempotent
+# — noop if model is already in the named volume /root/.ollama), then
+# execs the foreground `ollama serve` so Docker sees it as PID 1.
+ARG OLLAMA_MODEL=bge-m3
+ENV OLLAMA_MODEL=${OLLAMA_MODEL}
 COPY ollama/bin/ilma-ollama-entrypoint.sh /usr/local/bin/ilma-ollama-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/ilma-ollama-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/ilma-ollama-entrypoint.sh"]

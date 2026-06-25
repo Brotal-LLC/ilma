@@ -107,25 +107,31 @@ migration step needed.
 
 ### ilma-ollama (embedder, optional but recommended)
 
-ilma defaults to `bge-m3` (1024-dim) as the embedding model. The image
-includes an entrypoint that pulls `bge-m3` on first start if it's not
-already in the named volume, so you don't need a separate init step.
+ilma defaults to `bge-m3` (1024-dim) as the embedding model. The image's
+entrypoint pulls `bge-m3` on every container start — idempotent when the
+named volume `/root/.ollama` already has the model on disk.
 
 ```bash
 docker run -d --name ilma-ollama --restart always \
     --cpus=4 --memory=8g \
     --health-cmd="curl -fsS http://localhost:11434/api/tags || exit 1" \
     --health-interval=15s --health-timeout=5s --health-retries=10 \
-    --health-start-period=120s \
+    --health-start-period=180s \
     -v ilma-ollama-data:/root/.ollama \
     -p 127.0.0.1:11434:11434 \
     ghcr.io/brotal-llc/ilma-ollama:latest
 ```
 
 The first boot takes 1-3 minutes while the model downloads (~2.2GB for
-bge-m3). The healthcheck waits 120s before starting to account for that.
+bge-m3). The healthcheck waits 180s before starting to account for that.
 After the first run, subsequent restarts are instant because the model is
 in the named volume.
+
+**Why not bake the model into the image?** BuildKit's sandbox can't
+reliably reach a long-running background `ollama serve` from inside a
+single `RUN` step, so we can't pre-pull at build time. Pulling on every
+start (with named-volume caching) is faster on subsequent runs and
+keeps the image small (~1GB instead of ~3.2GB).
 
 ### ilma-agent (the API/MCP service)
 
@@ -187,7 +193,7 @@ services:
       interval: 15s
       timeout: 5s
       retries: 10
-      start_period: 120s
+      start_period: 180s
 
 volumes:
   ilma-pg-data:
