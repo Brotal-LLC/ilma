@@ -101,7 +101,8 @@ def ensure_graph(dsn: str) -> None:
         cur.execute("LOAD 'age'")
         cur.execute("SET search_path = ag_catalog, public")
         cur.execute("SELECT count(*) FROM ag_graph WHERE name = %s", (GRAPH_NAME,))
-        exists = cur.fetchone()[0] > 0
+        row = cur.fetchone()
+        exists = row is not None and row[0] > 0
         if not exists:
             cur.execute(f"SELECT create_graph({cypher_quote(GRAPH_NAME)})")
 
@@ -202,7 +203,8 @@ class PgGraphRepo:
             cur.execute("LOAD 'age'")
             cur.execute("SET search_path = ag_catalog, public")
             cur.execute("SELECT count(*) FROM ag_graph WHERE name = %s", (GRAPH_NAME,))
-            if cur.fetchone()[0] > 0:
+            row = cur.fetchone()
+            if row is not None and row[0] > 0:
                 cur.execute(f"SELECT drop_graph({cypher_quote(GRAPH_NAME)}, true)")
             cur.execute(f"SELECT create_graph({cypher_quote(GRAPH_NAME)})")
 

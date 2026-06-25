@@ -390,17 +390,18 @@ def plan_graph_rebuild(
 
     # CO_OCCURS (Memory ↔ Memory, same session_id). Dedupe via (min,max,session).
     co_pairs: dict[tuple[int, int, str], None] = {}
-    # Index sessions to memory ids.
     sessions: dict[str, list[int]] = {}
     for sm in session_memories:
         if sm["memory_id"] not in memory_ids:
             continue
         sessions.setdefault(sm["session_id"], []).append(sm["memory_id"])
     for session_id, mem_ids in sessions.items():
-        uniq = sorted(set(mem_ids))
-        for i, a in enumerate(uniq):
-            for b in uniq[i + 1 :]:
-                co_pairs[(a, b, session_id)] = None
+        uniq_mem_ids: list[int] = sorted(set(mem_ids))
+        for i in range(len(uniq_mem_ids)):
+            for j in range(i + 1, len(uniq_mem_ids)):
+                co_a_id: int = uniq_mem_ids[i]
+                co_b_id: int = uniq_mem_ids[j]
+                co_pairs[(co_a_id, co_b_id, session_id)] = None
     for a_id, b_id, session_id in co_pairs:
         edges.append(
             GraphEdge(
@@ -443,15 +444,15 @@ def plan_graph_rebuild(
         tags = m.get("tags", []) or []
         content = m.get("content", "") or ""
         for s in skills:
-            via: set[str] = set()
+            skill_via: set[str] = set()
             if _skill_tag_match(tags, s["name"]):
-                via.add("tag")
+                skill_via.add("tag")
             if _skill_body_match(content, s["name"]):
-                via.add("body")
+                skill_via.add("body")
             if _skill_marker_match(content, s["name"]):
-                via.add("marker")
-            if via:
-                skill_refs[(m["id"], s["id"])] = via
+                skill_via.add("marker")
+            if skill_via:
+                skill_refs[(m["id"], s["id"])] = skill_via
     for (mem_id, skill_id), vias in skill_refs.items():
         edges.append(
             GraphEdge(
