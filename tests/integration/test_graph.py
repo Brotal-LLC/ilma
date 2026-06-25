@@ -2,9 +2,9 @@
 
 These tests exercise the full Cypher round-trip against a real Postgres +
 pgvector + Apache AGE instance via Testcontainers. The image used is
-``ghcr.io/skb50bd/hermes-memory/hermes-postgres:latest`` (Shakib's production
-build) which has all three extensions installed on PG18 — the same image
-that backs the live ``hermes_default`` DB.
+``ghcr.io/brotal-llc/ilma-pg:latest`` (ilma's own production build) which
+ships with all the extensions (vector, pg_cron, timescaledb, age, ltree,
+pg_trgm) on PG18 — the same image that backs production deployments.
 
 The graph is a derived view: every test drops+rebuilds the graph in setup and
 teardown so tests are independent. Cypher execution goes through
@@ -37,7 +37,9 @@ from ilma.storage.postgres_graph import (
 )
 
 # Use Shakib's own image — same versions as production.
-IMAGE = "ghcr.io/skb50bd/hermes-memory/hermes-postgres:latest"
+# Use ilma's own production DB image — same image that backs
+# production deployments, built by .github/workflows/ilma.yml (build-pg job).
+IMAGE = "ghcr.io/brotal-llc/ilma-pg:latest"
 
 
 @pytest.fixture(scope="session")

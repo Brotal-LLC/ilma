@@ -239,15 +239,16 @@ memory.ilma.bd {
 - `pytest` with Testcontainers
 
 **Tasks:**
-1. `docker/api/Dockerfile` (multi-stage, ~100MB)
-2. `docker/postgres/Dockerfile` (from hermes-memory, renamed)
-3. `infra/` compose files
-4. `.devcontainer/` config
-5. Verify non-root containers
-6. Domain cert via Caddy
+1. `Dockerfile` at repo root (multi-stage, ~140MB) — **DONE**
+2. `pg/Dockerfile` (Postgres 18 + pgvector + pg_cron + timescaledb + age) — **DONE**, published as `ghcr.io/brotal-llc/ilma-pg`
+3. ~~`infra/` compose files~~ — **REMOVED**: compose-managed local dev lives in `~/infra/` on the host, not in this repo. CI publishes images directly.
+4. `.devcontainer/` config (deferred)
+5. Verify non-root containers — **DONE** (`USER 1000:1000` in `Dockerfile`)
+6. Domain cert via Caddy (host concern, `~/infra/Caddyfile`)
 
-**ETA:** 2-3 days
-**Deliverable:** `docker compose up` in `~/infra/ilma/`
+**ETA:** mostly done; remaining items deferred.
+
+**Deliverable:** `docker compose up` in `~/infra/ilma/` (compose lives on host, not in this repo)
 
 ---
 

@@ -1,7 +1,0 @@
-services:
-  api:
-    command: ["ilma", "serve", "--host", "0.0.0.0", "--port", "8000", "--reload"]
-    environment:
-      ILMA_RELOAD: "1"
-    volumes:
-      - ../../src:/app/src:rw

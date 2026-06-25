@@ -44,6 +44,6 @@ dist/
 logs/
 *.log
 
-# Compose-managed local data (if a bind mount is ever used instead of named volumes)
-docker/**/data/
-docker/**/.data/
+# Local Postgres data volumes if anyone bind-mounts into a pg/ container
+pg/**/data/
+pg/**/.data/
