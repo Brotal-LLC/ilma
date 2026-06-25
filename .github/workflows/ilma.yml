@@ -60,6 +60,10 @@ on:
         description: "Build and push the ilma Postgres image (ghcr.io/brotal-llc/ilma-pg)"
         type: boolean
         default: false
+      push_ollama:
+        description: "Build and push the ilma Ollama embedder image (ghcr.io/brotal-llc/ilma-ollama)"
+        type: boolean
+        default: false
   schedule:
     - cron: "0 6 * * 1"
 
@@ -177,7 +181,7 @@ jobs:
     if: >-
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      (github.event_name == 'workflow_dispatch' && (inputs.push_docker || inputs.push_pg))
+      (github.event_name == 'workflow_dispatch' && (inputs.push_docker || inputs.push_pg || inputs.push_ollama))
     runs-on: [self-hosted, Linux, X64, inframework]
     outputs:
       build_tag: ${{ steps.sha.outputs.value }}
@@ -331,6 +335,81 @@ jobs:
           labels: |
             org.opencontainers.image.title=ilma-pg
             org.opencontainers.image.description=Postgres 18 + pgvector + pg_cron + timescaledb + apache-age for ilma
+            org.opencontainers.image.source=https://github.com/Brotal-LLC/ilma
+            org.opencontainers.image.url=https://github.com/Brotal-LLC/ilma
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+# ==============================================================================
+# PHASE 5c — Build & publish Ollama embedder image (push to main/tag or
+# manual workflow_dispatch with push_ollama=true, gated on tag).
+#
+# Builds ghcr.io/brotal-llc/ilma-ollama — a thin wrapper over
+# ollama/ollama that pre-pulls bge-m3 (~2.2GB) at image build time and
+# wraps the upstream entrypoint to ensure the model is present on
+# every container start (idempotent). Use as the ILMA_EMBED_BASE_URL
+# target for self-hosted embeddings.
+#
+# Image is ~3.2GB on GHCR (ollama runtime + bge-m3 model blob). Build
+# cache via GHA keeps subsequent builds fast.
+# ==============================================================================
+  build-ollama:
+    needs: [tag]
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.push_ollama)
+    runs-on: [self-hosted, Linux, X64, inframework]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: brotal-llc/ilma-ollama
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: tags
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          EVENT="${GITHUB_EVENT_NAME:-push}"
+          REF="${GITHUB_REF:-refs/heads/main}"
+          TAGS="${REGISTRY}/${IMAGE_NAME}:${SHORT_SHA}"
+          if [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
+            TAGS="${TAGS},${REGISTRY}/${IMAGE_NAME}:main,${REGISTRY}/${IMAGE_NAME}:latest"
+          fi
+          if [ "$EVENT" = "push" ] && [[ "$REF" == refs/tags/v* ]]; then
+            TAG_NAME="${REF#refs/tags/}"
+            TAGS="${TAGS},${REGISTRY}/${IMAGE_NAME}:${TAG_NAME}"
+          fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            TAGS="${TAGS},${REGISTRY}/${IMAGE_NAME}:workflow"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Pushing tags: ${TAGS}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./ollama/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=ilma-ollama
+            org.opencontainers.image.description=Ollama + bge-m3 embedder for ilma (1024-dim, auto-pulled)
             org.opencontainers.image.source=https://github.com/Brotal-LLC/ilma
             org.opencontainers.image.url=https://github.com/Brotal-LLC/ilma
           cache-from: type=gha

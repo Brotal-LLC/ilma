@@ -47,3 +47,7 @@ logs/
 # Local Postgres data volumes if anyone bind-mounts into a pg/ container
 pg/**/data/
 pg/**/.data/
+
+# Local Ollama model caches if anyone bind-mounts into an ollama/ container
+ollama/**/data/
+ollama/**/.ollama/
