@@ -32,6 +32,8 @@ on:
       - "Dockerfile"
       - ".hadolint.yaml"
       - "docker/**"
+      - "pg/**"
+      - "ollama/**"
       - ".github/workflows/ilma.yml"
       - ".github/actionlint.yaml"
   pull_request:
@@ -44,6 +46,8 @@ on:
       - "Dockerfile"
       - ".hadolint.yaml"
       - "docker/**"
+      - "pg/**"
+      - "ollama/**"
       - ".github/workflows/ilma.yml"
       - ".github/actionlint.yaml"
   workflow_dispatch:
