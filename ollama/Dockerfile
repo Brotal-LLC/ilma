@@ -22,8 +22,9 @@
 FROM ollama/ollama:latest
 
 # Healthcheck — Ollama's HTTP API responds on /api/tags once the server is up.
+# Uses bash's /dev/tcp since curl/wget/nc aren't available in the ollama base.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=10 \
-    CMD curl -fsS http://localhost:11434/api/tags || exit 1
+    CMD bash -c "(echo > /dev/tcp/localhost/11434) 2>/dev/null || exit 1"
 
 # Expose the Ollama HTTP API on its default port.
 EXPOSE 11434
