@@ -89,15 +89,14 @@ ilma/
 │   ├── unit/
 │   ├── integration/
 │   └── conftest.py
-├── migrations/
-├── docker/
-│   ├── postgres/
-│   │   ├── Dockerfile
-│   │   └── ilma-init.sh
-│   └── api/
-│       └── Dockerfile
-└── docs/
-    └── architecture.md
+├── pg/
+│   ├── Dockerfile             # Postgres 18 + pgvector + pg_cron + timescaledb + age
+│   └── bin/                   # ilma-pg-entrypoint.sh, ilma-pg-init.sh, ilma-pg-cron.sh
+├── ollama/
+│   ├── Dockerfile             # ollama/ollama + bge-m3 (1024-dim) pulled on container start
+│   └── bin/                   # ilma-ollama-entrypoint.sh
+├── docs/
+│   └── architecture.md
 ```
 
 **Parallel substreams:**
@@ -188,42 +187,71 @@ GET  /wiki/search
 
 **Goal:** One-command deployment.
 
-**`~/infra/ilma/compose.yml`:**
+**Status: SHIPPED.** `ilma-pg` and `ilma-ollama` images are published to
+GHCR; the README has the canonical `docker run` recipes with named
+volumes, restart policies, and resource limits. The local-dev compose
+file lives in `~/infra/ilma/compose.yaml` on the deploy host (NOT in
+this repo — per project layout decision).
+
+**`~/infra/ilma/compose.yaml` (canonical recipe):**
 ```yaml
 services:
-  ilma-postgres:
-    image: ghcr.io/brotal-llc/ilma/postgres:latest
-    volumes: [ilma-postgres-data:/var/lib/postgresql/data]
+  ilma-db:
+    image: ghcr.io/brotal-llc/ilma-pg:latest
+    container_name: ilma-db
+    restart: always
+    cpus: 2
+    memory: 4G
     environment:
+      POSTGRES_DB: ilma
+      POSTGRES_USER: ilma
       POSTGRES_PASSWORD: ${ILMA_PG_PASSWORD}
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "ilma"]
-
-  ilma-api:
-    image: ghcr.io/brotal-llc/ilma/api:latest
-    environment:
-      ILMA_DSN: postgresql://ilma:***@ilma-postgres:5432/ilma
-    depends_on:
-      ilma-postgres: { condition: service_healthy }
-    user: "1000:1000"
-
-  caddy:
-    image: caddy:2-alpine
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy-data:/data
-      - caddy-config:/config
-    ports: ["443:443"]
-    environment:
-      ILMA_API_HOST: ilma-api:8000
+      - ilma-pg-data:/var/lib/postgresql/data
+      - ilma-pg-init:/docker-entrypoint-initdb.d
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ilma-ollama:
+    image: ghcr.io/brotal-llc/ilma-ollama:latest
+    container_name: ilma-ollama
+    restart: always
+    cpus: 4
+    memory: 8G
+    volumes:
+      - ilma-ollama-data:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "(echo > /dev/tcp/localhost/11434) 2>/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 180s
 
 volumes:
-  ilma-postgres-data:
-  caddy-data:
-  caddy-config:
+  ilma-pg-data:
+  ilma-pg-init:
+  ilma-ollama-data:
 ```
 
-**Caddyfile:**
+**Container names are stable contracts:**
+- `ilma-db` — Postgres 18 + all extensions (replaces the deprecated
+  `ghcr.io/skb50bd/hermes-memory/hermes-postgres`).
+- `ilma-ollama` — Ollama + bge-m3 (1024-dim embedder). Pulls bge-m3 on
+  every container start; named volume caches it across restarts.
+  First start takes ~80s for the model download.
+- `ilma-agent` — the API/MCP service. Run however you like (systemd,
+  docker, supervisor); just point `ILMA_DSN` at `ilma-db:5432`.
+
+**Caddy (terminates TLS, reverse-proxies to `ilma-agent:8000`):**
+Caddyfile lives in `~/infra/Caddyfile` (host-resident, not in this
+repo). It handles cert issuance via the Cloudflare DNS plugin.
 ```
 memory.ilma.bd {
     reverse_proxy ilma-api:8000
