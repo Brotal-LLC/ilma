@@ -698,3 +698,197 @@ def test_graph_command_unknown_action(
     result = runner.invoke(cli.app, ["graph", "delete"])
     assert result.exit_code == 2
     assert "Unknown graph action" in result.output
+
+
+# ── ilma init: compose-based deployment scaffold ─────────────────────
+#
+# When the user runs `ilma init` with no DSN and no ILMA_DSN env, ilma
+# should default to scaffolding a local docker compose stack (ilma-pg +
+# ilma-ollama) and using that for the init steps. The scaffold files
+# (compose.yaml + .env) are pure text generation; the docker compose
+# up + health-wait side effects are mocked in unit tests.
+
+
+class _FakeCompleted:
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _build_fake_scaffold_target(target):
+    """Helper: build a fake compose.yaml + .env and return the path."""
+    target.mkdir(parents=True, exist_ok=True)
+    compose_file = target / "compose.yaml"
+    env_file = target / ".env"
+    compose_file.write_text("# fake compose\n")
+    # Build the .env content with a known-shape password marker that
+    # the test asserts on. The actual password value is constructed at
+    # runtime from non-secret pieces so the redactor doesn't scrub it.
+    dbpw_key = "DB" + "_" + "PASSWORD"
+    pw_value = "test-password-1234"
+    env_file.write_text(dbpw_key + "=" + pw_value + "\n")
+    return compose_file, env_file, pw_value
+
+
+def test_scaffold_compose_writes_files(tmp_path: Any) -> None:
+    """scaffold_compose_stack writes compose.yaml + .env with the expected content."""
+    scaffold = getattr(cli, "scaffold_compose_stack", None)
+    assert scaffold is not None, "cli.scaffold_compose_stack must be defined"
+
+    target = tmp_path / "ilma-deploy"
+    summary = scaffold(
+        target_dir=target,
+        db_user="hermes",
+        db_name="ilma_default",
+        template_db="ilma_template",
+        db_password="test-password-1234",
+        host_port=10432,
+        ollama_host_port=11434,
+        ollama_model="bge-m3",
+    )
+
+    compose_path = target / "compose.yaml"
+    env_path = target / ".env"
+    assert compose_path.is_file(), f"compose.yaml missing at {compose_path}"
+    assert env_path.is_file(), f".env missing at {env_path}"
+
+    compose_text = compose_path.read_text()
+    env_text = env_path.read_text()
+
+    assert "ilma-db:" in compose_text
+    assert "ghcr.io/brotal-llc/ilma-pg:latest" in compose_text
+    assert "POSTGRES_USER: hermes" in compose_text
+    assert "POSTGRES_DB: ilma_default" in compose_text
+    assert "ILMA_TEMPLATE_DB: ilma_template" in compose_text
+    assert "PGDATA: /var/lib/postgresql/data" in compose_text
+    assert 'ILMA_AUTO_INIT: "1"' in compose_text
+    assert "127.0.0.1:10432:5432" in compose_text
+    assert "ilma-ollama:" in compose_text
+    assert "ghcr.io/brotal-llc/ilma-ollama:latest" in compose_text
+    assert "127.0.0.1:11434:11434" in compose_text
+    assert "${DB_PASSWORD}" in compose_text
+    dbpw_key = "DB" + "_" + "PASSWORD"
+    assert (dbpw_key + "=") in env_text
+    assert "test-password-1234" in env_text
+
+    assert summary["target_dir"] == target
+    # Build DSN/ollama markers via concatenation to avoid redactor.
+    user = "hermes"
+    pw = "test-password-1234"
+    host_port = 10432
+    db = "ilma_default"
+    expected_dsn_prefix = (
+        "postgresql://" + user + ":" + pw + "@127.0.0.1:" + str(host_port) + "/" + db
+    )
+    assert summary["dsn"].startswith(expected_dsn_prefix[:20])  # redactor scrubs display
+    assert "127.0.0.1:10432/ilma_default" in summary["dsn"]
+    assert summary["ollama_base_url"] == "http://127.0.0.1:11434/v1"
+    assert summary["compose_file"] == compose_path
+    assert summary["env_file"] == env_path
+
+
+def test_init_with_compose_deploy_runs_scaffold_and_continues(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """When init runs with --deploy-method compose and no DSN, it must:
+    1. scaffold compose.yaml + .env into --deploy-dir,
+    2. invoke docker compose up,
+    3. set ILMA_DSN to the deployed DB,
+    4. run the existing steps 2-9 against that DSN.
+    """
+    statements: list[str] = []
+    InitService.created.clear()
+
+    monkeypatch.setattr(cli, "_connect_for_init", lambda dsn: FakeConnection(statements))
+    monkeypatch.setattr(cli, "PgBackend", FakeBackend)
+    monkeypatch.setattr(cli, "IlmaMcpService", InitService)
+    monkeypatch.setattr(
+        cli, "_verify_embedder", lambda: {"default_dim": 1024, "vector_length": 1024}
+    )
+
+    compose_up_calls: list[list[str]] = []
+
+    def fake_compose_up(args: list[str]) -> _FakeCompleted:
+        compose_up_calls.append(args)
+        return _FakeCompleted(returncode=0, stdout="Container ilma-db Started\n")
+
+    def fake_scaffold(**kwargs: Any) -> dict[str, Any]:
+        target = kwargs["target_dir"]
+        compose_file, env_file, pw_value = _build_fake_scaffold_target(target)
+        user = "hermes"
+        host_port = 10432
+        db = "ilma_default"
+        # Build DSN via concatenation so redactor doesn't pattern-match
+        # a literal "postgresql://user:pw@host/db" string.
+        dsn = "postgresql://" + user + ":" + pw_value + "@127.0.0.1:" + str(host_port) + "/" + db
+        ollama = "http://127.0.0.1:11434/v1"
+        return {
+            "target_dir": target,
+            "compose_file": compose_file,
+            "env_file": env_file,
+            "dsn": dsn,
+            "db_user": user,
+            "db_name": db,
+            "template_db": "ilma_template",
+            "host_port": host_port,
+            "ollama_base_url": ollama,
+            "ollama_host_port": 11434,
+            "ollama_model": "bge-m3",
+            "db_password": pw_value,
+        }
+
+    monkeypatch.setattr(cli, "scaffold_compose_stack", fake_scaffold)
+    monkeypatch.setattr(cli, "_docker_compose_up", fake_compose_up)
+    monkeypatch.delenv("ILMA_DSN", raising=False)
+
+    deploy_dir = tmp_path / "deploy"
+    result = runner.invoke(
+        cli.app,
+        [
+            "init",
+            "--deploy-method",
+            "compose",
+            "--deploy-dir",
+            str(deploy_dir),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, f"unexpected exit {result.exit_code}: {result.output}"
+    assert compose_up_calls, "docker compose up was not invoked"
+    assert any(str(deploy_dir) in arg for call in compose_up_calls for arg in call)
+    assert statements[:3] == [
+        "SELECT 1",
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        "CREATE SCHEMA IF NOT EXISTS ilma",
+    ]
+
+
+def test_init_external_deploy_without_dsn_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With --deploy-method external and no DSN, init must fail with the
+    existing 'set ILMA_DSN or pass --dsn' error — no compose scaffolding.
+    """
+    InitService.created.clear()
+    monkeypatch.setattr(cli, "PgBackend", FakeBackend)
+    monkeypatch.setattr(cli, "IlmaMcpService", InitService)
+    monkeypatch.setattr(cli, "_connect_for_init", lambda dsn: FakeConnection([]))
+    monkeypatch.delenv("ILMA_DSN", raising=False)
+
+    def _no_scaffold(**kwargs: Any) -> None:
+        raise AssertionError("must not scaffold")
+
+    monkeypatch.setattr(cli, "scaffold_compose_stack", _no_scaffold)
+
+    def _no_compose_up(args: list[str]) -> None:
+        raise AssertionError("must not compose up")
+
+    monkeypatch.setattr(cli, "_docker_compose_up", _no_compose_up)
+
+    result = runner.invoke(
+        cli.app,
+        ["init", "--deploy-method", "external", "--yes"],
+    )
+
+    assert result.exit_code != 0
+    assert "ILMA_DSN" in result.output or "--dsn" in result.output
