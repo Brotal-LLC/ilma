@@ -7,7 +7,7 @@
 # INTENTIONALLY EXCLUDED (vs. sv):
 #   - Deploy job. The user has directed that ilma is distributed as a package
 #     (PyPI + GHCR image) and the CI flow must NOT mutate the user's local
-#     installation. Deploy-to-ilma.aamar.cloud is a local manual step via
+#     installation. Deploy-to-ilma.ekta.dev is a local manual step via
 #     ~/infra/scripts/deploy-ilma.sh, not a CI/CD concern.
 #   - PyPI publish is gated behind workflow_dispatch `publish_pypi=true` or
 #     `v*` tag pushes via Trusted Publishing OIDC. No long-lived PyPI token is
@@ -442,7 +442,7 @@ jobs:
 # "ilmarine" project (Feb 2022, internal-pypi upload squat), so we
 # publish under the hyphenated "ilma-agent" distribution name.
 #
-# Does NOT deploy to ilma.aamar.cloud (user OOB: CI must not mutate
+# Does NOT deploy to ilma.ekta.dev (user OOB: CI must not mutate
 # local environment).
 # ==============================================================================
   release:
